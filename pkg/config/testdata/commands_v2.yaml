@@ -1,0 +1,34 @@
+version: "2"
+
+agents:
+
+  root:
+    model: openai/gpt-4o
+    instruction: you are a helpful computer assistant
+    commands:
+      df: "check disk"
+      ls: "list files"
+
+  another_agent:
+    model: openai/gpt-4o
+    instruction: you are a helpful computer assistant
+    commands:
+      - df: "check disk"
+      - ls: "list files"
+
+  advanced_agent:
+    model: openai/gpt-4o
+    instruction: you are a helpful computer assistant
+    commands:
+      fix-lint:
+        description: "Fix linting errors in the codebase"
+        instruction: "Fix the lint issues"
+      analyze:
+        description: "Analyze the code"
+        instruction: |
+          Analyze the following files: $1
+          Focus on: $2
+
+  none_agent:
+    model: openai/gpt-4o
+    instruction: you are a helpful computer assistant

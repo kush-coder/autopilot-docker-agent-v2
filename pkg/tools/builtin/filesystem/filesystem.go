@@ -1,0 +1,1526 @@
+package filesystem
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"unicode/utf8"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/config"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/fsx"
+	pathx "github.com/docker/docker-agent/pkg/path"
+	"github.com/docker/docker-agent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tools/builtin/filesystem/types"
+)
+
+// annotateFilesystemSpan stamps the operation kind and target path
+// onto the active runtime.tool.handler span. Paths ship unconditionally
+// — they're the main signal of what the agent touched. Drop or hash
+// `cagent.tool.filesystem.path` at the OTel collector if paths
+// routinely reveal identifiers you don't want shipped.
+func annotateFilesystemSpan(ctx context.Context, op, path string) {
+	span := trace.SpanFromContext(ctx)
+	if !span.IsRecording() {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("cagent.tool.filesystem.op", op),
+	}
+	if path != "" {
+		attrs = append(attrs, attribute.String("cagent.tool.filesystem.path", path))
+	}
+	span.SetAttributes(attrs...)
+}
+
+// maxFilesystemPathsAttr caps how many entries from args.Paths land on a
+// span attribute. Many backends drop attributes over a few KiB and per-
+// element string costs add up fast on a multi-hundred-path call. The
+// path_count attribute (always recorded) preserves total fidelity.
+const maxFilesystemPathsAttr = 32
+
+// cappedPaths returns paths truncated to maxFilesystemPathsAttr entries.
+// Callers should also record `path_count = len(paths)` separately so the
+// truncation is visible.
+func cappedPaths(paths []string) []string {
+	if len(paths) <= maxFilesystemPathsAttr {
+		return paths
+	}
+	return paths[:maxFilesystemPathsAttr]
+}
+
+const (
+	ToolNameReadFile           = types.ToolNameReadFile
+	ToolNameReadMultipleFiles  = types.ToolNameReadMultipleFiles
+	ToolNameEditFile           = types.ToolNameEditFile
+	ToolNameWriteFile          = types.ToolNameWriteFile
+	ToolNameDirectoryTree      = types.ToolNameDirectoryTree
+	ToolNameListDirectory      = types.ToolNameListDirectory
+	ToolNameSearchFilesContent = types.ToolNameSearchFilesContent
+	ToolNameMkdir              = types.ToolNameMkdir
+	ToolNameRmdir              = types.ToolNameRmdir
+)
+
+// PostEditConfig represents a post-edit command configuration
+type PostEditConfig struct {
+	Path string // File path pattern (glob-style)
+	Cmd  string // Command to execute (with $path placeholder)
+}
+
+type ToolSet struct {
+	workingDir       string
+	postEditCommands []PostEditConfig
+	ignoreVCS        bool
+	repoMatcher      *fsx.VCSMatcher
+	repoMatcherOnce  sync.Once
+
+	// sandboxBroken is set when allow/deny list construction fails.
+	// When true, all filesystem operations are rejected (fail-closed).
+	sandboxBroken bool
+
+	// allowList, when non-nil, restricts every filesystem operation to paths
+	// that resolve under one of the listed roots. nil means "no allow-list";
+	// the toolset accepts any path the OS will let it touch.
+	allowList *pathRootSet
+	// denyList, when non-nil, rejects every filesystem operation on paths
+	// that resolve under one of the listed roots, even when the path also
+	// matches the allow-list. nil means "no deny-list".
+	denyList     *pathRootSet
+	agentsIgnore *fsx.AgentsIgnoreMatcher
+}
+
+// Verify interface compliance
+var (
+	_ tools.ToolSet      = (*ToolSet)(nil)
+	_ tools.Instructable = (*ToolSet)(nil)
+	_ io.Closer          = (*ToolSet)(nil)
+)
+
+type Opt func(*ToolSet)
+
+func WithPostEditCommands(postEditCommands []PostEditConfig) Opt {
+	return func(t *ToolSet) {
+		t.postEditCommands = postEditCommands
+	}
+}
+
+func WithIgnoreVCS(ignoreVCS bool) Opt {
+	return func(t *ToolSet) {
+		t.ignoreVCS = ignoreVCS
+	}
+}
+
+func WithAgentsIgnore(m *fsx.AgentsIgnoreMatcher) Opt {
+	return func(t *ToolSet) {
+		t.agentsIgnore = m
+	}
+}
+
+// WithAllowList restricts every filesystem operation to paths that resolve
+// under one of the supplied roots. Each entry may be:
+//   - "." — the agent's working directory
+//   - "~" or "~/..." — the user's home directory
+//   - "$VAR" / "${VAR}" — an environment variable
+//   - any absolute or relative path (relative paths are anchored at the
+//     working directory)
+//
+// Symlinks are resolved before the containment check, so a symlink inside an
+// allowed root cannot be used to escape it. An empty or nil slice disables
+// the allow-list and preserves the default behaviour (any path is allowed).
+//
+// Invalid entries (e.g. an empty string) are logged and the allow-list is
+// silently dropped, mirroring how WithIgnoreVCS handles construction errors.
+func WithAllowList(roots []string) Opt {
+	return func(t *ToolSet) {
+		set, err := newPathRootSet(t.workingDir, roots)
+		if err != nil {
+			slog.Error("filesystem allow-list: invalid entry; disabling toolset", "error", err)
+			t.sandboxBroken = true
+			return
+		}
+		t.allowList = set
+	}
+}
+
+// WithDenyList forbids every filesystem operation on paths that resolve under
+// one of the supplied roots. Tokens follow the same expansion rules as
+// [WithAllowList]. The deny-list takes precedence over the allow-list: a
+// path that matches both is rejected. An empty or nil slice disables the
+// deny-list.
+func WithDenyList(roots []string) Opt {
+	return func(t *ToolSet) {
+		set, err := newPathRootSet(t.workingDir, roots)
+		if err != nil {
+			slog.Error("filesystem deny-list: invalid entry; disabling toolset", "error", err)
+			t.sandboxBroken = true
+			return
+		}
+		t.denyList = set
+	}
+}
+
+// CreateToolSet is used by the tools registry.
+func CreateToolSet(toolset latest.Toolset, runConfig *config.RuntimeConfig) (tools.ToolSet, error) {
+	ts, err := NewFromConfig(toolset, runConfig)
+	if err != nil {
+		return nil, err
+	}
+	return ts, nil
+}
+
+// NewFromConfig builds a filesystem toolset with its configured policies and hooks.
+func NewFromConfig(toolset latest.Toolset, runConfig *config.RuntimeConfig) (*ToolSet, error) {
+	wd := runConfig.WorkingDir
+	if wd == "" {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get working directory: %w", err)
+		}
+	}
+
+	var opts []Opt
+
+	ignoreVCS := true
+	if toolset.IgnoreVCS != nil {
+		ignoreVCS = *toolset.IgnoreVCS
+	}
+	opts = append(opts, WithIgnoreVCS(ignoreVCS))
+
+	matcher, err := fsx.NewAgentsIgnoreMatcher(wd)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", fsx.AgentsIgnoreFile, err)
+	}
+	if matcher != nil {
+		opts = append(opts, WithAgentsIgnore(matcher))
+	}
+
+	if len(toolset.AllowList) > 0 {
+		opts = append(opts, WithAllowList(toolset.AllowList))
+	}
+	if len(toolset.DenyList) > 0 {
+		opts = append(opts, WithDenyList(toolset.DenyList))
+	}
+
+	if len(toolset.PostEdit) > 0 {
+		postEditConfigs := make([]PostEditConfig, len(toolset.PostEdit))
+		for i, pe := range toolset.PostEdit {
+			postEditConfigs[i] = PostEditConfig{
+				Path: pe.Path,
+				Cmd:  pe.Cmd,
+			}
+		}
+		opts = append(opts, WithPostEditCommands(postEditConfigs))
+	}
+
+	return New(wd, opts...), nil
+}
+
+func New(workingDir string, opts ...Opt) *ToolSet {
+	t := &ToolSet{
+		workingDir: workingDir,
+	}
+
+	for _, opt := range opts {
+		opt(t)
+	}
+
+	return t
+}
+
+// Close releases any *os.Root file descriptors held by the allow/deny lists.
+// It is safe to call Close multiple times.
+func (t *ToolSet) Close() error {
+	if t.allowList != nil {
+		t.allowList.close()
+	}
+	if t.denyList != nil {
+		t.denyList.close()
+	}
+	return nil
+}
+
+func (t *ToolSet) Instructions() string {
+	var b strings.Builder
+	b.WriteString(`## Filesystem Tools
+
+- Relative paths resolve from the working directory; absolute paths and ".." work as expected
+- Prefer read_multiple_files over sequential read_file calls
+- Use search_files_content to locate code or text across files
+- Use exclude patterns in searches and max_depth in directory_tree to limit output`)
+	if d := t.allowList.describe(); d != "" {
+		fmt.Fprintf(&b, "\n- These tools are restricted to paths under: %s. Any other path is rejected without touching the filesystem.", d)
+	}
+	if d := t.denyList.describe(); d != "" {
+		fmt.Fprintf(&b, "\n- These tools must not access paths under: %s. Such paths are rejected without touching the filesystem.", d)
+	}
+	return b.String()
+}
+
+type DirectoryTreeArgs = types.DirectoryTreeArgs
+
+type WriteFileArgs = types.WriteFileArgs
+
+type ReadMultipleFilesArgs = types.ReadMultipleFilesArgs
+
+type ReadMultipleFilesMeta = types.ReadMultipleFilesMeta
+
+type SearchFilesContentArgs = types.SearchFilesContentArgs
+
+type SearchFilesContentMeta = types.SearchFilesContentMeta
+
+type ListDirectoryArgs = types.ListDirectoryArgs
+
+type CreateDirectoryArgs struct {
+	Paths []string `json:"paths" jsonschema:"Directories to create"`
+}
+
+type RemoveDirectoryArgs struct {
+	Paths []string `json:"paths" jsonschema:"Directories to remove"`
+}
+
+type ListDirectoryMeta = types.ListDirectoryMeta
+
+type DirectoryTreeMeta = types.DirectoryTreeMeta
+
+type ReadFileArgs = types.ReadFileArgs
+
+type ReadFileMeta = types.ReadFileMeta
+
+type Edit = types.Edit
+
+type EditFileArgs = types.EditFileArgs
+
+// ParseEditFileArgs parses edit_file arguments, including common LLM JSON malformations.
+func ParseEditFileArgs(data []byte) (EditFileArgs, error) {
+	return types.ParseEditFileArgs(data)
+}
+
+func (t *ToolSet) Tools(context.Context) ([]tools.Tool, error) {
+	return []tools.Tool{
+		{
+			Name:        ToolNameDirectoryTree,
+			Category:    "filesystem",
+			Description: "Get a recursive tree view of files and directories as a JSON structure.",
+			Parameters:  tools.MustSchemaFor[DirectoryTreeArgs](),
+			// Manually define the schema here because
+			// tools.MustSchemaFor(reflect.TypeFor[*TreeNode]()) doesn't support recursive types.
+			OutputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "The name of the node",
+					},
+					"type": map[string]any{
+						"type":        "string",
+						"description": "The type of the node (file or directory)",
+					},
+					"children": map[string]any{
+						"type":        "array",
+						"description": "Optional list of child nodes",
+						"items": map[string]any{
+							"$ref": "#",
+						},
+					},
+				},
+				"required":             []string{"name", "type"},
+				"additionalProperties": false,
+			},
+			Handler: tools.NewHandler(t.handleDirectoryTree),
+			Annotations: tools.ToolAnnotations{
+				ReadOnlyHint: true,
+				Title:        "Directory Tree",
+			},
+		},
+		{
+			Name:         ToolNameEditFile,
+			Category:     "filesystem",
+			Description:  "Make line-based edits to a text file. Each edit replaces exact line sequences with new content.",
+			Parameters:   tools.MustSchemaFor[EditFileArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      t.editFileHandler(),
+			Annotations: tools.ToolAnnotations{
+				Title: "Edit",
+			},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:         ToolNameListDirectory,
+			Category:     "filesystem",
+			Description:  "Get a detailed listing of all files and directories in a specified path.",
+			Parameters:   tools.MustSchemaFor[ListDirectoryArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      tools.NewHandler(t.handleListDirectory),
+			Annotations: tools.ToolAnnotations{
+				ReadOnlyHint: true,
+				Title:        "List Directory",
+			},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:         ToolNameReadFile,
+			Category:     "filesystem",
+			Description:  "Read the contents of a file from the file system. By default the complete file is returned; for text files the optional line (1-based start line) and limit (maximum number of lines) arguments select a line range. Supports text files and images (jpg, png, gif, webp). Images are returned as image content that you can view directly.",
+			Parameters:   tools.MustSchemaFor[ReadFileArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      tools.NewHandler(t.handleReadFile),
+			Annotations: tools.ToolAnnotations{
+				ReadOnlyHint: true,
+				Title:        "Read",
+			},
+		},
+		{
+			Name:        ToolNameReadMultipleFiles,
+			Category:    "filesystem",
+			Description: "Read the contents of multiple files simultaneously.",
+			Parameters:  tools.MustSchemaFor[ReadMultipleFilesArgs](),
+			// TODO(dga): depends on the json param
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      tools.NewHandler(t.handleReadMultipleFiles),
+			Annotations: tools.ToolAnnotations{
+				ReadOnlyHint: true,
+				Title:        "Read Multiple Files",
+			},
+		},
+		{
+			Name:         ToolNameSearchFilesContent,
+			Category:     "filesystem",
+			Description:  "Searches for text or regex patterns in the content of files matching a GLOB pattern.",
+			Parameters:   tools.MustSchemaFor[SearchFilesContentArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      tools.NewHandler(t.handleSearchFilesContent),
+			Annotations: tools.ToolAnnotations{
+				ReadOnlyHint: true,
+				Title:        "Search Files Content",
+			},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:         ToolNameWriteFile,
+			Category:     "filesystem",
+			Description:  "Create a new file or completely overwrite an existing file with new content.",
+			Parameters:   tools.MustSchemaFor[WriteFileArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      tools.NewHandler(t.handleWriteFile),
+			Annotations: tools.ToolAnnotations{
+				Title: "Write",
+			},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:         ToolNameMkdir,
+			Category:     "filesystem",
+			Description:  "Create one or more new directories or nested directory structures.",
+			Parameters:   tools.MustSchemaFor[CreateDirectoryArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      tools.NewHandler(t.handleCreateDirectory),
+			Annotations: tools.ToolAnnotations{
+				Title: "Create Directory",
+			},
+		},
+		{
+			Name:         ToolNameRmdir,
+			Category:     "filesystem",
+			Description:  "Remove one or more empty directories.",
+			Parameters:   tools.MustSchemaFor[RemoveDirectoryArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Handler:      tools.NewHandler(t.handleRemoveDirectory),
+			Annotations: tools.ToolAnnotations{
+				Title: "Remove Directory",
+			},
+		},
+	}, nil
+}
+
+// HasPostEditCommands reports whether writes may be changed by configured commands.
+func (t *ToolSet) HasPostEditCommands() bool {
+	return len(t.postEditCommands) > 0
+}
+
+// ExecutePostEditCommands runs hooks after a transport writes a checked, canonical path.
+func (t *ToolSet) ExecutePostEditCommands(ctx context.Context, path string) error {
+	if len(t.postEditCommands) == 0 {
+		return nil
+	}
+	workingDir, err := filepath.EvalSymlinks(t.workingDir)
+	if err != nil {
+		return fmt.Errorf("resolving post-edit working directory: %w", err)
+	}
+	return runPostEditCommands(ctx, workingDir, t.postEditCommands, path)
+}
+
+// executePostEditCommands executes any matching post-edit commands for the given file path
+func (t *ToolSet) executePostEditCommands(ctx context.Context, filePath string) error {
+	if len(t.postEditCommands) == 0 {
+		return nil
+	}
+	return runPostEditCommands(ctx, t.workingDir, t.postEditCommands, filePath)
+}
+
+// resolvePath resolves a path relative to the working directory.
+// A leading "~" or "~/" is expanded to the user's home directory so that
+// LLM-supplied paths like "~/file.txt" work without the agent having to
+// know the user's home directory upfront. Relative paths (including ".")
+// are joined with the working directory. Absolute paths and paths
+// starting with ".." are used as-is.
+//
+// resolvePath does NOT enforce the allow- or deny-lists; callers should use
+// [resolveAndCheckPath] when those checks are required (i.e. for any path
+// that originates from a tool argument).
+func (t *ToolSet) resolvePath(path string) string {
+	if expandedPath, err := pathx.ExpandHomeDir(path); err == nil {
+		path = expandedPath
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+
+	return filepath.Clean(filepath.Join(t.workingDir, path))
+}
+
+// ResolveAndCheckPath applies filesystem policy without reading or writing file contents.
+// Transport adapters must also enforce containment when they access the path.
+func (t *ToolSet) ResolveAndCheckPath(path string) (string, error) {
+	return t.resolveAndCheckPath(path)
+}
+
+// resolveAndCheckPath is the canonical entry point used by every filesystem
+// handler that operates on a user-supplied path. It resolves the path against
+// the working directory and validates the result against the allow- and
+// deny-lists. The returned string is the on-disk path the handler should pass
+// to the os.* call.
+//
+// When neither list is configured the function is functionally equivalent to
+// [resolvePath]. When a list is configured, symlinks are resolved before the
+// containment check so that a symlink inside an allowed directory cannot leak
+// access outside it. Paths that don't exist yet (e.g. for write_file or
+// create_directory) are checked against their nearest existing ancestor so
+// the caller can still create them.
+//
+// The deny-list takes precedence over the allow-list: a path that matches
+// both is rejected.
+//
+// SECURITY NOTE: this static check has a small TOCTOU window before the
+// subsequent os.* call. To close it for paths that fall inside the
+// allow-list, the toolset routes its actual I/O through the [*os.Root]
+// handles owned by [pathRootSet] (see [Tool.readFile], [.writeFile],
+// [.mkdirAll], etc.). Those methods reject ".." and out-of-root symlinks
+// in the kernel, regardless of timing. The threat model is the LLM
+// itself, which has no symlink-creation primitive, so this layered
+// defence is sufficient.
+//
+// PLATFORM NOTE: [*os.Root] guarantees vary by GOOS — see the package
+// docs. Notable carve-outs that matter here:
+//
+//   - Linux bind mounts, filesystem boundaries, /proc special files and
+//     Unix device files are NOT blocked by [*os.Root]. An allow-list root
+//     that contains, e.g., a /proc bind mount can still leak.
+//   - On GOOS=js (WASM), [*os.Root] is itself vulnerable to TOCTOU in
+//     symlink validation and cannot guarantee containment. The agent is
+//     not supported on WASM today; this is documented for future ports.
+//   - On GOOS=plan9 and GOOS=js, [*os.Root] tracks a directory name
+//     rather than a file descriptor, so it does not follow renames of
+//     the allow-list root.
+//   - On GOOS=windows, [*os.Root] additionally rejects reserved device
+//     names (NUL, COM1, …), which is a strengthening, not a weakening.
+func (t *ToolSet) resolveAndCheckPath(path string) (string, error) {
+	if t.sandboxBroken {
+		return "", errors.New("filesystem toolset is disabled due to invalid allow/deny list configuration")
+	}
+
+	resolved := t.resolvePath(path)
+	if t.agentsIgnore.Match(resolved) {
+		return "", fmt.Errorf("path %q is excluded by %s", path, fsx.AgentsIgnoreFile)
+	}
+	if t.allowList == nil && t.denyList == nil {
+		return resolved, nil
+	}
+	realPath, err := resolveRealPath(resolved)
+	if err != nil {
+		return "", fmt.Errorf("resolving %q: %w", path, err)
+	}
+	if t.denyList != nil && t.denyList.contains(realPath) {
+		return "", fmt.Errorf("path %q is inside a denied directory (%s)", path, t.denyList.describe())
+	}
+	if t.allowList != nil && !t.allowList.contains(realPath) {
+		return "", fmt.Errorf("path %q is outside the allowed directories (%s)", path, t.allowList.describe())
+	}
+	return resolved, nil
+}
+
+// rootedAccess returns the [*os.Root] handle and rooted (slash-separated)
+// name for resolved when the allow-list is configured.
+//
+//   - No allow-list → (nil, "", nil): callers fall back to plain os.*.
+//   - Path inside an entry whose [*os.Root] is open → (root, rel, nil):
+//     callers MUST use the rooted handle so the kernel re-checks
+//     containment on every component, closing the race.
+//   - Path inside an entry whose [*os.Root] could not be opened (e.g. the
+//     directory did not exist at construction time) → (nil, "", nil):
+//     callers fall back to plain os.* with the lexical guarantee already
+//     enforced by [resolveAndCheckPath].
+//   - Path no longer inside any entry (e.g. a symlink swap moved the real
+//     target out between the static check and the I/O) → (nil, "", err):
+//     callers MUST refuse; falling back to os.* would follow the symlink.
+func (t *ToolSet) rootedAccess(resolved string) (*os.Root, string, error) {
+	if t.allowList == nil {
+		return nil, "", nil
+	}
+	realPath, err := resolveRealPath(resolved)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolving %q: %w", resolved, err)
+	}
+	entry, rel := t.allowList.entryFor(realPath)
+	if entry == nil {
+		return nil, "", fmt.Errorf("path %q is no longer inside the allow-list (possible symlink swap)", resolved)
+	}
+	return entry.root, rel, nil // entry.root may be nil; caller falls back to os.*
+}
+
+// readFile is a TOCTOU-safe equivalent of [os.ReadFile] for paths that the
+// allow-list contains. When no rooted access is available it falls back to
+// the plain [os.ReadFile]. Callers MUST pass a path that has already been
+// validated by [resolveAndCheckPath].
+func (t *ToolSet) readFile(resolved string) ([]byte, error) {
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if root != nil {
+		return root.ReadFile(rel)
+	}
+	return os.ReadFile(resolved)
+}
+
+// writeFile is a TOCTOU-safe equivalent of [os.WriteFile]. See [readFile]
+// for the contract. The call is rejected by the kernel when any component
+// of rel is an out-of-root symlink, so an attacker cannot win the swap
+// race between the [resolveAndCheckPath] check and the write.
+func (t *ToolSet) writeFile(resolved string, data []byte, perm os.FileMode) error {
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return err
+	}
+	if root != nil {
+		return root.WriteFile(rel, data, perm)
+	}
+	return os.WriteFile(resolved, data, perm)
+}
+
+// stat is a TOCTOU-safe equivalent of [os.Stat]. See [readFile] for the
+// contract.
+func (t *ToolSet) stat(resolved string) (os.FileInfo, error) {
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if root != nil {
+		return root.Stat(rel)
+	}
+	return os.Stat(resolved)
+}
+
+// mkdirAll is a TOCTOU-safe equivalent of [os.MkdirAll]. See [readFile]
+// for the contract. A rooted MkdirAll on "." is a no-op (the root already
+// exists by construction).
+func (t *ToolSet) mkdirAll(resolved string, perm os.FileMode) error {
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return err
+	}
+	if root != nil {
+		if rel == "." {
+			return nil
+		}
+		return root.MkdirAll(rel, perm)
+	}
+	return os.MkdirAll(resolved, perm)
+}
+
+// readDir is a TOCTOU-safe equivalent of [os.ReadDir]. See [readFile]
+// for the contract. We use [*os.Root].Open + [*os.File].ReadDir because
+// [*os.Root] does not expose ReadDir directly.
+func (t *ToolSet) readDir(resolved string) ([]os.DirEntry, error) {
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if root != nil {
+		f, err := root.Open(rel)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		return f.ReadDir(-1)
+	}
+	return os.ReadDir(resolved)
+}
+
+// removeDir removes an empty directory at resolved. When a rooted handle
+// is available we use [*os.Root].Remove, which only unlinks the named
+// directory entry and refuses to follow a trailing symlink that escapes
+// the root. Otherwise we fall back to the platform-specific [rmdir].
+func (t *ToolSet) removeDir(resolved string) error {
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return err
+	}
+	if root != nil {
+		return root.Remove(rel)
+	}
+	return rmdir(resolved)
+}
+
+// initGitignoreMatcher initializes the gitignore matcher for the working directory.
+// It is safe to call multiple times; initialization only happens once.
+func (t *ToolSet) initGitignoreMatcher() {
+	if !t.ignoreVCS {
+		return
+	}
+
+	t.repoMatcherOnce.Do(func() {
+		absDir, err := filepath.Abs(t.workingDir)
+		if err != nil {
+			slog.Warn("Failed to get absolute path for working directory", "dir", t.workingDir, "error", err)
+			return
+		}
+
+		matcher, err := fsx.NewVCSMatcher(absDir)
+		if err != nil {
+			slog.Warn("Failed to create VCS matcher", "path", absDir, "error", err)
+			return
+		}
+
+		t.repoMatcher = matcher
+	})
+}
+
+// shouldIgnorePath checks if a path should be ignored based on VCS rules
+func (t *ToolSet) shouldIgnorePath(path string) bool {
+	if t.agentsIgnore.Match(path) {
+		return true
+	}
+
+	if !t.ignoreVCS {
+		return false
+	}
+
+	// Always ignore .git directories and their contents
+	normalizedPath := filepath.ToSlash(path)
+	if strings.Contains(normalizedPath, "/.git/") || strings.HasSuffix(normalizedPath, "/.git") {
+		return true
+	}
+
+	// Lazily initialize the gitignore matcher on first use
+	t.initGitignoreMatcher()
+
+	return t.repoMatcher != nil && t.repoMatcher.ShouldIgnore(path)
+}
+
+// Handler implementations
+
+func (t *ToolSet) handleDirectoryTree(ctx context.Context, args DirectoryTreeArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "directory_tree", args.Path)
+	resolvedPath, err := t.resolveAndCheckPath(args.Path)
+	if err != nil {
+		return tools.ResultError(err.Error()), nil
+	}
+
+	// Create a path checker that enforces allow/deny lists for every child path.
+	// This prevents symlinked directories from being traversed outside the sandbox.
+	pathChecker := func(childPath string) error {
+		_, err := t.resolveAndCheckPath(childPath)
+		return err
+	}
+
+	tree, err := fsx.DirectoryTree(ctx, resolvedPath, pathChecker, t.shouldIgnorePath, maxFiles)
+	if err != nil {
+		return tools.ResultError(fmt.Sprintf("Error building directory tree: %s", err)), nil
+	}
+
+	result, err := json.Marshal(tree)
+	if err != nil {
+		return tools.ResultError(fmt.Sprintf("Error formatting tree: %s", err)), nil
+	}
+
+	fileCount, dirCount := countTreeNodes(tree)
+	meta := DirectoryTreeMeta{
+		FileCount: fileCount,
+		DirCount:  dirCount,
+		Truncated: fileCount+dirCount >= maxFiles,
+	}
+
+	return &tools.ToolCallResult{
+		Output: string(result),
+		Meta:   meta,
+	}, nil
+}
+
+func countTreeNodes(node *fsx.TreeNode) (files, dirs int) {
+	if node == nil {
+		return 0, 0
+	}
+	if node.Type == "file" {
+		return 1, 0
+	}
+	if node.Type == "directory" {
+		dirs = 1
+		for _, child := range node.Children {
+			f, d := countTreeNodes(child)
+			files += f
+			dirs += d
+		}
+	}
+	return files, dirs
+}
+
+// editFileHandler returns a ToolHandler that parses edit_file arguments with
+// repair logic for malformed JSON, then delegates to handleEditFile.
+// This bypasses tools.NewHandler because Go's json.Unmarshal scanner rejects
+// structurally invalid JSON before calling any custom UnmarshalJSON method.
+func (t *ToolSet) editFileHandler() tools.ToolHandler {
+	return func(ctx context.Context, toolCall tools.ToolCall, _ tools.Runtime) (*tools.ToolCallResult, error) {
+		data := toolCall.Function.Arguments
+		if data == "" {
+			data = "{}"
+		}
+		args, err := ParseEditFileArgs([]byte(data))
+		if err != nil {
+			return nil, err
+		}
+		return t.handleEditFile(ctx, args)
+	}
+}
+
+func (t *ToolSet) handleEditFile(ctx context.Context, args EditFileArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "edit_file", args.Path)
+	resolvedPath, err := t.resolveAndCheckPath(args.Path)
+	if err != nil {
+		return tools.ResultError(err.Error()), nil
+	}
+
+	content, err := t.readFile(resolvedPath)
+	if err != nil {
+		return tools.ResultError(fmt.Sprintf("Error reading file: %s", err)), nil
+	}
+
+	originalContent := string(content)
+	modifiedContent := originalContent
+
+	var changes []string
+	for i, edit := range args.Edits {
+		// strings.Contains always matches "" and strings.Replace would insert
+		// newText at offset 0, silently prepending to the file.
+		if edit.OldText == "" {
+			return tools.ResultError(fmt.Sprintf("Edit %d failed: oldText must not be empty", i+1)), nil
+		}
+		if !strings.Contains(modifiedContent, edit.OldText) {
+			return tools.ResultError(fmt.Sprintf("Edit %d failed: old text not found", i+1)), nil
+		}
+		modifiedContent = strings.Replace(modifiedContent, edit.OldText, edit.NewText, 1)
+		changes = append(changes, fmt.Sprintf("Edit %d: Replaced %d characters", i+1, len(edit.OldText)))
+	}
+
+	if err := t.writeFile(resolvedPath, []byte(modifiedContent), 0o644); err != nil {
+		return tools.ResultError(fmt.Sprintf("Error writing file: %s", err)), nil
+	}
+
+	if err := t.executePostEditCommands(ctx, resolvedPath); err != nil {
+		return tools.ResultError(fmt.Sprintf("File edited successfully but post-edit command failed: %s", err)), nil
+	}
+
+	if len(changes) == 1 {
+		return tools.ResultSuccess("File edited successfully. " + strings.TrimPrefix(changes[0], "Edit 1: ")), nil
+	}
+
+	return tools.ResultSuccess("File edited successfully. Changes:\n" + strings.Join(changes, "\n")), nil
+}
+
+func (t *ToolSet) handleListDirectory(ctx context.Context, args ListDirectoryArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "list_directory", args.Path)
+	resolvedPath, err := t.resolveAndCheckPath(args.Path)
+	if err != nil {
+		return tools.ResultError(err.Error()), nil
+	}
+
+	entries, err := t.readDir(resolvedPath)
+	if err != nil {
+		return tools.ResultError(fmt.Sprintf("Error reading directory: %s", err)), nil
+	}
+
+	var result strings.Builder
+	meta := ListDirectoryMeta{}
+	count := 0
+	for _, entry := range entries {
+		entryPath := filepath.Join(resolvedPath, entry.Name())
+		if t.shouldIgnorePath(entryPath) {
+			continue
+		}
+
+		if entry.IsDir() {
+			fmt.Fprintf(&result, "DIR  %s\n", entry.Name())
+			meta.Dirs = append(meta.Dirs, entry.Name())
+		} else {
+			fmt.Fprintf(&result, "FILE %s\n", entry.Name())
+			meta.Files = append(meta.Files, entry.Name())
+		}
+		count++
+		if count >= maxFiles {
+			result.WriteString("...output truncated due to file limit...\n")
+			meta.Truncated = true
+			break
+		}
+	}
+
+	// An empty Output is rendered as a generic "(no output)" placeholder
+	// upstream, which the model cannot distinguish from a tool failure and
+	// typically retries with a shell command. Say explicitly that the
+	// listing succeeded and the directory is empty.
+	if count == 0 {
+		if len(entries) == 0 {
+			fmt.Fprintf(&result, "Directory is empty: %s\n", resolvedPath)
+		} else {
+			fmt.Fprintf(&result, "Directory has no visible entries (%d hidden by ignore patterns): %s\n", len(entries), resolvedPath)
+		}
+	}
+
+	return &tools.ToolCallResult{
+		Output: result.String(),
+		Meta:   meta,
+	}, nil
+}
+
+func (t *ToolSet) handleReadFile(ctx context.Context, args ReadFileArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "read_file", args.Path)
+	if err := ValidateReadFileRange(args.Line, args.Limit); err != nil {
+		return &tools.ToolCallResult{
+			Output:  err.Error(),
+			IsError: true,
+			Meta:    ReadFileMeta{Path: args.Path, Error: err.Error()},
+		}, nil
+	}
+
+	resolvedPath, err := t.resolveAndCheckPath(args.Path)
+	if err != nil {
+		return &tools.ToolCallResult{
+			Output:  err.Error(),
+			IsError: true,
+			Meta:    ReadFileMeta{Path: args.Path, Error: err.Error()},
+		}, nil
+	}
+
+	// Check if the file exists before any type detection.
+	info, err := t.stat(resolvedPath)
+	if err != nil {
+		var errMsg string
+		if errors.Is(err, fs.ErrNotExist) {
+			errMsg = "not found"
+		} else {
+			errMsg = err.Error()
+		}
+
+		return &tools.ToolCallResult{
+			Output:  errMsg,
+			IsError: true,
+			Meta: ReadFileMeta{
+				Error: errMsg,
+			},
+		}, nil
+	}
+
+	// Only check for image files on regular files (not directories, etc.)
+	if info.Mode().IsRegular() && chat.IsImageFile(resolvedPath) {
+		// Byte-exact line ranges are meaningless for base64 image content;
+		// reject instead of silently returning the whole image.
+		if args.Line != nil || args.Limit != nil {
+			errMsg := "line/limit are only supported for text files; read the image without line/limit"
+			return &tools.ToolCallResult{
+				Output:  errMsg,
+				IsError: true,
+				Meta:    ReadFileMeta{Path: args.Path, Error: errMsg},
+			}, nil
+		}
+		return t.readImageFile(resolvedPath, args.Path)
+	}
+
+	if args.Line != nil || args.Limit != nil {
+		selected, totalLines, err := t.readFileLineRange(resolvedPath, args.Line, args.Limit)
+		if err != nil {
+			return &tools.ToolCallResult{
+				Output:  err.Error(),
+				IsError: true,
+				Meta:    ReadFileMeta{Path: args.Path, Error: err.Error()},
+			}, nil
+		}
+		return &tools.ToolCallResult{
+			Output: string(selected),
+			Meta: ReadFileMeta{
+				Path:      args.Path,
+				LineCount: totalLines,
+			},
+		}, nil
+	}
+
+	content, err := t.readFile(resolvedPath)
+	if err != nil {
+		return &tools.ToolCallResult{
+			Output:  err.Error(),
+			IsError: true,
+			Meta: ReadFileMeta{
+				Error: err.Error(),
+			},
+		}, nil
+	}
+
+	text := string(content)
+
+	return &tools.ToolCallResult{
+		Output: text,
+		Meta: ReadFileMeta{
+			Path:      args.Path,
+			LineCount: strings.Count(text, "\n") + 1,
+		},
+	}, nil
+}
+
+// ValidateReadFileRange rejects explicitly supplied non-positive range
+// values; nil means "not provided" and is always valid. It is exported so
+// alternative read_file implementations (e.g. the ACP override) apply the
+// same contract before doing any I/O.
+func ValidateReadFileRange(line, limit *int) error {
+	if line != nil && *line < 1 {
+		return fmt.Errorf("invalid line %d: line numbers are 1-based and must be >= 1", *line)
+	}
+	if limit != nil && *limit < 1 {
+		return fmt.Errorf("invalid limit %d: limit must be >= 1", *limit)
+	}
+	return nil
+}
+
+// readFileLineRange streams the file at resolved and returns the exact bytes
+// of the requested 1-based line range (line terminators included, so a final
+// newline is preserved when present) plus the file's total line count
+// (newline count + 1, matching the full-read metadata). Only the selected
+// lines are held in memory. A nil line starts at the first line, a nil limit
+// reads through EOF, and a start past the last line yields empty content.
+// Like readFileHeader, it opens the file through rootedAccess so allow-listed
+// paths keep their TOCTOU protection.
+func (t *ToolSet) readFileLineRange(resolved string, line, limit *int) ([]byte, int, error) {
+	start := 1
+	if line != nil {
+		start = *line
+	}
+	maxLines := -1 // -1: read through EOF
+	if limit != nil {
+		maxLines = *limit
+	}
+
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var file *os.File
+	if root != nil {
+		file, err = root.Open(rel)
+	} else {
+		file, err = os.Open(resolved)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer file.Close()
+
+	// bufio.Reader.ReadSlice instead of a Scanner so arbitrarily long lines
+	// never hit a token limit: a long line simply arrives in multiple chunks
+	// sharing one line number, and chunks of unselected lines are discarded
+	// without being retained.
+	reader := bufio.NewReader(file)
+	var selected []byte
+	newlines := 0
+	current := 1
+	for {
+		chunk, readErr := reader.ReadSlice('\n')
+		if len(chunk) > 0 {
+			if current >= start && (maxLines < 0 || current-start < maxLines) {
+				selected = append(selected, chunk...)
+			}
+			if chunk[len(chunk)-1] == '\n' {
+				newlines++
+				current++
+			}
+		}
+		if readErr == nil || errors.Is(readErr, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			return selected, newlines + 1, nil
+		}
+		return nil, 0, readErr
+	}
+}
+
+// readImageFile reads an image file and returns it as base64-encoded image content.
+// The caller must ensure the file exists (e.g. via os.Stat) before calling this method.
+func (t *ToolSet) readImageFile(resolvedPath, originalPath string) (*tools.ToolCallResult, error) {
+	data, err := t.readFile(resolvedPath)
+	if err != nil {
+		errMsg := err.Error()
+		return &tools.ToolCallResult{
+			Output:  errMsg,
+			IsError: true,
+			Meta: ReadFileMeta{
+				Error: errMsg,
+			},
+		}, nil
+	}
+
+	mimeType := chat.DetectMimeType(resolvedPath)
+
+	// Resize the image if it exceeds provider limits (max 2000×2000, max 4.5MB).
+	resized, err := chat.ResizeImage(data, mimeType)
+	if err != nil {
+		// Check if the original exceeds limits before falling back
+		if len(data) > chat.MaxImageBytes {
+			return &tools.ToolCallResult{
+				Output:  fmt.Sprintf("Error: Image file too large (%d bytes, max %d bytes)", len(data), chat.MaxImageBytes),
+				IsError: true,
+				Meta:    ReadFileMeta{Path: originalPath, Error: "image too large"},
+			}, nil
+		}
+		// Original is within limits, proceed with fallback
+		slog.Warn("Image resize failed, sending original (within limits)", "path", originalPath, "error", err)
+		encoded := base64.StdEncoding.EncodeToString(data)
+		return &tools.ToolCallResult{
+			Output: fmt.Sprintf("Read image file %s [%s] (%d bytes)", originalPath, mimeType, len(data)),
+			Images: []tools.ImageContent{{Data: encoded, MimeType: mimeType}},
+			Meta:   ReadFileMeta{Path: originalPath},
+		}, nil
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(resized.Data)
+	output := fmt.Sprintf("Read image file %s [%s] (%d bytes)", originalPath, resized.MimeType, len(resized.Data))
+	if note := chat.FormatDimensionNote(resized); note != "" {
+		output += "\n" + note
+	}
+
+	return &tools.ToolCallResult{
+		Output: output,
+		Images: []tools.ImageContent{{Data: encoded, MimeType: resized.MimeType}},
+		Meta:   ReadFileMeta{Path: originalPath},
+	}, nil
+}
+
+func (t *ToolSet) handleReadMultipleFiles(ctx context.Context, args ReadMultipleFilesArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "read_multiple_files", "")
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int("cagent.tool.filesystem.path_count", len(args.Paths)),
+			attribute.StringSlice("cagent.tool.filesystem.paths", cappedPaths(args.Paths)),
+		)
+	}
+	type PathContent struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+
+	var contents []PathContent
+	var meta ReadMultipleFilesMeta
+
+	for _, path := range args.Paths {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		entry := ReadFileMeta{Path: path}
+
+		resolvedPath, err := t.resolveAndCheckPath(path)
+		if err != nil {
+			errMsg := err.Error()
+			contents = append(contents, PathContent{
+				Path:    path,
+				Content: errMsg,
+			})
+			entry.Error = errMsg
+			meta.Files = append(meta.Files, entry)
+			continue
+		}
+
+		content, err := t.readFile(resolvedPath)
+		if err != nil {
+			errMsg := err.Error()
+			if errors.Is(err, fs.ErrNotExist) {
+				errMsg = "not found"
+			}
+			contents = append(contents, PathContent{
+				Path:    path,
+				Content: errMsg,
+			})
+			entry.Error = errMsg
+			meta.Files = append(meta.Files, entry)
+			continue
+		}
+
+		text := string(content)
+		contents = append(contents, PathContent{
+			Path:    path,
+			Content: text,
+		})
+		entry.LineCount = strings.Count(text, "\n") + 1
+		meta.Files = append(meta.Files, entry)
+	}
+
+	var output string
+	if args.JSON {
+		jsonResult, err := json.Marshal(contents)
+		if err != nil {
+			return tools.ResultError(fmt.Sprintf("Error formatting JSON: %s", err)), nil
+		}
+		output = string(jsonResult)
+	} else {
+		var result strings.Builder
+		for _, content := range contents {
+			fmt.Fprintf(&result, "=== %s ===\n%s\n\n", content.Path, content.Content)
+		}
+		output = result.String()
+	}
+
+	return &tools.ToolCallResult{
+		Output: output,
+		Meta:   meta,
+	}, nil
+}
+
+func (t *ToolSet) handleSearchFilesContent(ctx context.Context, args SearchFilesContentArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "search_files_content", args.Path)
+	resolvedPath, err := t.resolveAndCheckPath(args.Path)
+	if err != nil {
+		return tools.ResultError(err.Error()), nil
+	}
+
+	var regex *regexp.Regexp
+	if args.IsRegex {
+		var err error
+		regex, err = regexp.Compile(args.Query)
+		if err != nil {
+			return tools.ResultError(fmt.Sprintf("Invalid regex pattern: %s", err)), nil
+		}
+	}
+
+	var out strings.Builder
+	filesWithMatches := make(map[string]struct{})
+	matchCount := 0
+	truncated := false
+
+	err = filepath.WalkDir(resolvedPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		// Check VCS ignore rules
+		if t.shouldIgnorePath(path) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		// Check exclude patterns against relative path from search root
+		relPath, err := filepath.Rel(resolvedPath, path)
+		if err != nil {
+			return nil
+		}
+
+		for _, exclude := range args.ExcludePatterns {
+			if matchExcludePattern(exclude, relPath) {
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+		}
+
+		// Only process files, not directories
+		if d.IsDir() {
+			return nil
+		}
+
+		// Check this file against allow/deny lists before reading.
+		// This prevents symlinks inside the allowed root from escaping the sandbox.
+		if _, checkErr := t.resolveAndCheckPath(path); checkErr != nil {
+			// Skip files outside the sandbox silently (don't fail the whole search).
+			return nil
+		}
+
+		// Only scan regular files within the size limit. We stat (following
+		// symlinks) rather than trust d.Info()'s lstat: t.readFile follows
+		// symlinks, so measuring the link itself would let a symlink to a
+		// huge file slip past the guard. Skipping non-regular files also
+		// avoids reading forever from a device or FIFO such as /dev/zero.
+		info, statErr := t.stat(path)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() > maxSearchFileSize {
+			return nil
+		}
+
+		binary, err := t.isBinaryFile(path)
+		if err != nil || binary {
+			return nil
+		}
+
+		content, err := t.readFile(path)
+		if err != nil {
+			return nil
+		}
+
+		lineNum := 0
+		for line := range strings.SplitSeq(string(content), "\n") {
+			lineNum++
+			var matched bool
+			var matchStart, matchEnd int
+
+			if args.IsRegex {
+				if loc := regex.FindStringIndex(line); loc != nil {
+					matched = true
+					matchStart, matchEnd = loc[0], loc[1]
+				}
+			} else {
+				if idx := strings.Index(line, args.Query); idx != -1 {
+					matched = true
+					matchStart, matchEnd = idx, idx+len(args.Query)
+				}
+			}
+
+			if matched {
+				filesWithMatches[path] = struct{}{}
+				preview := line
+				if len(preview) > 100 {
+					start := max(matchStart-20, 0)
+					end := min(matchEnd+20, len(preview))
+					// Snap to rune boundaries so we never split a multi-byte
+					// UTF-8 sequence in the preview.
+					for start > 0 && !utf8.RuneStart(preview[start]) {
+						start--
+					}
+					for end < len(preview) && !utf8.RuneStart(preview[end]) {
+						end++
+					}
+					preview = preview[start:end]
+				}
+
+				// Write matches straight into the builder rather than
+				// collecting them in a slice and joining at the end: that
+				// would hold every match twice (slice + joined copy). The
+				// builder's running length doubles as the output budget.
+				if matchCount > 0 {
+					out.WriteByte('\n')
+				}
+				fmt.Fprintf(&out, "%s:%d:%d: %s", path, lineNum, matchStart+1, preview)
+				matchCount++
+				if out.Len() >= maxSearchOutputBytes {
+					truncated = true
+					return fs.SkipAll
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return tools.ResultError(fmt.Sprintf("Error searching file contents: %s", err)), nil
+	}
+
+	meta := SearchFilesContentMeta{
+		MatchCount: matchCount,
+		FileCount:  len(filesWithMatches),
+	}
+
+	if matchCount == 0 {
+		return &tools.ToolCallResult{
+			Output: "No results found",
+			Meta:   meta,
+		}, nil
+	}
+
+	output := out.String()
+	if truncated {
+		output += "\n\n[Output truncated: exceeded 1 MiB limit. Narrow the search with a more specific query, path, or exclude patterns.]"
+	}
+
+	return &tools.ToolCallResult{
+		Output: output,
+		Meta:   meta,
+	}, nil
+}
+
+func (t *ToolSet) readFileHeader(resolved string, size int) ([]byte, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+
+	root, rel, err := t.rootedAccess(resolved)
+	if err != nil {
+		return nil, err
+	}
+
+	var file *os.File
+	if root != nil {
+		file, err = root.Open(rel)
+	} else {
+		file, err = os.Open(resolved)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	buf := make([]byte, size)
+	n, err := io.ReadFull(file, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+func (t *ToolSet) isBinaryFile(resolved string) (bool, error) {
+	header, err := t.readFileHeader(resolved, maxBinarySniffBytes)
+	if err != nil {
+		return false, err
+	}
+	return isBinaryContent(header), nil
+}
+
+func isBinaryContent(header []byte) bool {
+	if len(header) == 0 {
+		return false
+	}
+	if bytes.IndexByte(header, 0) >= 0 {
+		return true
+	}
+	return !strings.HasPrefix(http.DetectContentType(header), "text/")
+}
+
+func (t *ToolSet) handleWriteFile(ctx context.Context, args WriteFileArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "write_file", args.Path)
+	resolvedPath, err := t.resolveAndCheckPath(args.Path)
+	if err != nil {
+		return tools.ResultError(err.Error()), nil
+	}
+
+	// Create parent directory structure if it doesn't exist
+	dir := filepath.Dir(resolvedPath)
+	if err := t.mkdirAll(dir, 0o755); err != nil {
+		return tools.ResultError(fmt.Sprintf("Error creating directory structure: %s", err)), nil
+	}
+
+	if err := t.writeFile(resolvedPath, []byte(args.Content), 0o644); err != nil {
+		return tools.ResultError(fmt.Sprintf("Error writing file: %s", err)), nil
+	}
+
+	if err := t.executePostEditCommands(ctx, resolvedPath); err != nil {
+		return tools.ResultError(fmt.Sprintf("File written successfully but post-edit command failed: %s", err)), nil
+	}
+
+	return tools.ResultSuccess(fmt.Sprintf("File written successfully: %s (%d bytes)", args.Path, len(args.Content))), nil
+}
+
+func (t *ToolSet) handleCreateDirectory(ctx context.Context, args CreateDirectoryArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "create_directory", "")
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int("cagent.tool.filesystem.path_count", len(args.Paths)),
+			attribute.StringSlice("cagent.tool.filesystem.paths", cappedPaths(args.Paths)),
+		)
+	}
+	var results []string
+	for _, path := range args.Paths {
+		resolvedPath, err := t.resolveAndCheckPath(path)
+		if err != nil {
+			return tools.ResultError(err.Error()), nil
+		}
+		if err := t.mkdirAll(resolvedPath, 0o755); err != nil {
+			return tools.ResultError(fmt.Sprintf("Error creating directory %s: %s", path, err)), nil
+		}
+		results = append(results, "Directory created successfully: "+path)
+	}
+
+	return tools.ResultSuccess(strings.Join(results, "\n")), nil
+}
+
+func (t *ToolSet) handleRemoveDirectory(ctx context.Context, args RemoveDirectoryArgs) (*tools.ToolCallResult, error) {
+	annotateFilesystemSpan(ctx, "remove_directory", "")
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int("cagent.tool.filesystem.path_count", len(args.Paths)),
+			attribute.StringSlice("cagent.tool.filesystem.paths", cappedPaths(args.Paths)),
+		)
+	}
+	var results []string
+	for _, path := range args.Paths {
+		resolvedPath, err := t.resolveAndCheckPath(path)
+		if err != nil {
+			return tools.ResultError(err.Error()), nil
+		}
+
+		if err := t.removeDir(resolvedPath); err != nil {
+			return tools.ResultError(fmt.Sprintf("Error removing directory %s: %s", path, err)), nil
+		}
+		results = append(results, "Directory removed successfully: "+path)
+	}
+
+	return tools.ResultSuccess(strings.Join(results, "\n")), nil
+}
+
+// matchExcludePattern checks if a path should be excluded based on the exclude pattern
+// It supports glob patterns and directory wildcards like .git/*
+func matchExcludePattern(pattern, relPath string) bool {
+	// Normalize path separators to forward slashes for consistent matching
+	normalizedPath := filepath.ToSlash(relPath)
+	normalizedPattern := filepath.ToSlash(pattern)
+
+	// Handle directory patterns ending with /*
+	if dirPattern, found := strings.CutSuffix(normalizedPattern, "/*"); found {
+		// Check if path starts with the directory pattern
+		if strings.HasPrefix(normalizedPath, dirPattern+"/") || normalizedPath == dirPattern {
+			return true
+		}
+	}
+
+	// Try glob pattern matching on the full relative path
+	if matched, _ := filepath.Match(normalizedPattern, normalizedPath); matched {
+		return true
+	}
+
+	// Try glob pattern matching on just the base name for backwards compatibility
+	if matched, _ := filepath.Match(normalizedPattern, filepath.Base(normalizedPath)); matched {
+		return true
+	}
+
+	// Check if pattern matches any parent directory path
+	pathParts := strings.Split(normalizedPath, "/")
+	for i := range pathParts {
+		subPath := strings.Join(pathParts[:i+1], "/")
+		if matched, _ := filepath.Match(normalizedPattern, subPath); matched {
+			return true
+		}
+	}
+
+	return false
+}

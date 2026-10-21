@@ -1,0 +1,826 @@
+// Package fake provides a VCR-based proxy for replaying recorded AI API responses.
+// This is useful for E2E testing without making real API calls.
+package fake
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+	"gopkg.in/dnaeon/go-vcr.v4/pkg/cassette"
+	"gopkg.in/dnaeon/go-vcr.v4/pkg/recorder"
+
+	"github.com/docker/docker-agent/pkg/environment"
+	"github.com/docker/docker-agent/pkg/httpclient"
+)
+
+// ProxyOptions configures the fake proxy behavior.
+type ProxyOptions struct {
+	// SimulateStream adds delays between SSE chunks to simulate real streaming.
+	SimulateStream bool
+	// StreamChunkDelay is the delay between SSE chunks when SimulateStream is true.
+	// Defaults to 15ms if not set.
+	StreamChunkDelay time.Duration
+	// StreamEventGate optionally pauses after an SSE event (or EOF fragment) is flushed.
+	// Return nil to continue, or a channel to await; request cancellation also releases it.
+	// The event is only valid during the call. Calls from different streams may overlap.
+	// Overrides simulated delays when set.
+	StreamEventGate func(event []byte) <-chan struct{}
+	// UpstreamGateway, when set, forwards requests to this models gateway
+	// instead of the provider's public endpoint. Used when recording a
+	// session that normally routes through a models gateway. Only honored
+	// by the streaming recording path (StartRecordingProxy); the go-vcr
+	// replay path never forwards upstream.
+	UpstreamGateway string
+
+	// ReplayOnly permits cassette matching for custom origins without live forwarding.
+	ReplayOnly bool
+}
+
+// ProxyOption is a function that configures ProxyOptions.
+type ProxyOption func(*ProxyOptions)
+
+// WithSimulateStream enables simulated streaming with delays between chunks.
+func WithSimulateStream(enabled bool) ProxyOption {
+	return func(o *ProxyOptions) {
+		o.SimulateStream = enabled
+	}
+}
+
+// WithStreamChunkDelay sets the delay between SSE chunks.
+func WithStreamChunkDelay(d time.Duration) ProxyOption {
+	return func(o *ProxyOptions) {
+		o.StreamChunkDelay = d
+	}
+}
+
+// StartProxy starts an internal HTTP proxy that replays cassette responses.
+// It returns the proxy URL and a cleanup function that should be called when done.
+func StartProxy(ctx context.Context, cassettePath string, opts ...ProxyOption) (string, func() error, error) {
+	options := &ProxyOptions{
+		StreamChunkDelay: 15 * time.Millisecond,
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+	return StartProxyWithOptions(ctx, cassettePath, recorder.ModeReplayOnly, nil, nil, options)
+}
+
+// StartRecordingProxy starts a proxy that records AI API interactions to a cassette file.
+// Without an upstream gateway it forwards to the providers' public endpoints,
+// injecting API keys from environment variables. With an upstream gateway it
+// forwards through that gateway instead, so gateway-managed auth keeps working.
+// The recorded cassette can later be replayed using StartProxy.
+// This uses a streaming-aware recorder that allows responses to stream through
+// in real-time while being recorded, unlike the standard VCR recorder.
+func StartRecordingProxy(ctx context.Context, cassettePath, upstreamGateway string) (string, func() error, error) {
+	headerUpdater := APIKeyHeaderUpdater
+	if upstreamGateway != "" {
+		headerUpdater = gatewayAuthHeaderUpdater(upstreamGateway)
+	}
+	return StartStreamingRecordingProxy(ctx, cassettePath, upstreamGateway, headerUpdater)
+}
+
+// StartStreamingRecordingProxy starts a recording proxy with streaming support.
+// Unlike StartProxyWithOptions which buffers entire responses, this allows
+// streaming responses to pass through in real-time while being recorded.
+func StartStreamingRecordingProxy(
+	ctx context.Context,
+	cassettePath string,
+	upstreamGateway string,
+	headerUpdater func(host string, req *http.Request),
+) (string, func() error, error) {
+	return startStreamingRecordingProxy(ctx, cassettePath, upstreamGateway, headerUpdater, http.DefaultTransport)
+}
+
+func startStreamingRecordingProxy(
+	ctx context.Context,
+	cassettePath string,
+	upstreamGateway string,
+	headerUpdater func(host string, req *http.Request),
+	transport http.RoundTripper,
+) (string, func() error, error) {
+	// Fail fast on a bad gateway URL instead of returning 500s per request.
+	if upstreamGateway != "" {
+		if u, err := url.Parse(upstreamGateway); err != nil || u.Scheme == "" || u.Host == "" {
+			return "", nil, fmt.Errorf("invalid upstream gateway URL %q", upstreamGateway)
+		}
+	}
+
+	streamRec, err := NewStreamingRecorder(cassettePath)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create streaming recorder: %w", err)
+	}
+
+	streamRec.transport = transport
+	streamRec.SetCaptureRequest(func(req *http.Request) ([]byte, error) {
+		recorded := req.Clone(req.Context())
+		if req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			recorded.Body = body
+		}
+		if err := httpclient.RemoveEncryptedConfig(recorded); err != nil {
+			return nil, err
+		}
+		req.Header.Del(httpclient.EncryptedConfigDigestHeader)
+		if recorded.Body == nil || recorded.Body == http.NoBody {
+			return nil, nil
+		}
+		defer recorded.Body.Close()
+		return io.ReadAll(recorded.Body)
+	})
+
+	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
+	e.Any("/*", Handle(streamRec, headerUpdater, &ProxyOptions{UpstreamGateway: upstreamGateway}))
+
+	httpServer := httptest.NewServer(e)
+
+	cleanup := func() error {
+		// Forcefully close all client connections first.
+		httpServer.CloseClientConnections()
+		httpServer.Close()
+
+		// Stop the recorder with a timeout
+		stopDone := make(chan error, 1)
+		go func() {
+			stopDone <- streamRec.Stop()
+		}()
+
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+
+		select {
+		case err := <-stopDone:
+			return err
+		case <-ctx.Done():
+			slog.WarnContext(ctx, "Recording proxy cleanup timed out, cassette may be incomplete")
+			return nil
+		}
+	}
+
+	return httpServer.URL, cleanup, nil
+}
+
+// APIKeyHeaderUpdater injects API keys from environment variables into request headers.
+// This is used when recording API interactions to ensure real API calls succeed.
+func APIKeyHeaderUpdater(host string, req *http.Request) {
+	if req.Header.Get("X-Cagent-Evaluator-Recording") == "1" && req.Header.Get("Authorization") != "" {
+		return
+	}
+	key := envAPIKeyForHost(host)
+	switch host {
+	case "https://api.openai.com/v1", "https://api.typesafe.ai", "https://api.mistral.ai/v1", "https://openrouter.ai/api/v1":
+		req.Header.Set("Authorization", "Bearer "+key)
+	case "https://api.anthropic.com":
+		req.Header.Del("Authorization")
+		req.Header.Set("X-Api-Key", key)
+	case "https://generativelanguage.googleapis.com":
+		req.Header.Del("Authorization")
+		req.Header.Set("X-Goog-Api-Key", key)
+	}
+}
+
+// envAPIKeyForHost returns the env-provided API key for a provider's public
+// endpoint, or "" for unknown hosts.
+func envAPIKeyForHost(host string) string {
+	switch host {
+	case "https://api.openai.com/v1":
+		return os.Getenv("OPENAI_API_KEY")
+	case "https://api.typesafe.ai":
+		return os.Getenv("TYPESAFE_API_KEY")
+	case "https://api.anthropic.com":
+		return os.Getenv("ANTHROPIC_API_KEY")
+	case "https://generativelanguage.googleapis.com":
+		return os.Getenv("GOOGLE_API_KEY")
+	case "https://api.mistral.ai/v1":
+		return os.Getenv("MISTRAL_API_KEY")
+	case "https://openrouter.ai/api/v1":
+		return os.Getenv("OPENROUTER_API_KEY")
+	default:
+		return ""
+	}
+}
+
+// gatewayAuthHeaderUpdater re-authenticates requests forwarded to a models
+// gateway. The client authenticated against the localhost proxy URL, which
+// passes the same Docker trust check a trusted gateway does, so it attached
+// a fresh Desktop token to every request.
+func gatewayAuthHeaderUpdater(gateway string) func(host string, req *http.Request) {
+	if environment.IsTrustedDockerURL(gateway) {
+		// The Desktop token the client attached is exactly what the gateway
+		// expects (localhost gateways are equally trusted in normal mode).
+		return func(string, *http.Request) {}
+	}
+	// Non-Docker gateways must never see the Desktop token. Strip the
+	// credential headers the client set and re-apply the provider env key
+	// it would have sent to the gateway directly (SDKs default to env keys
+	// when no gateway token is available).
+	return func(host string, req *http.Request) {
+		req.Header.Del("Authorization")
+		req.Header.Del("X-Api-Key")
+		req.Header.Del("X-Goog-Api-Key")
+		if !isEvaluatorRequest(req) && envAPIKeyForHost(host) != "" {
+			APIKeyHeaderUpdater(host, req)
+		}
+	}
+}
+
+func isEvaluatorRequest(req *http.Request) bool {
+	return req.Header.Get("X-Cagent-Evaluator") == "1" ||
+		(req.Method == http.MethodPost && (strings.HasSuffix(req.URL.Path, "/v1/systemone") || strings.HasSuffix(req.URL.Path, "/v1/decisions")))
+}
+
+// RecordingTransport routes already-authenticated evaluator calls through a
+// local recorder without replacing environment-provider credentials.
+func RecordingTransport(gateway string) func(http.RoundTripper) http.RoundTripper {
+	return func(base http.RoundTripper) http.RoundTripper {
+		return &recordingTransport{base: base, gateway: gateway}
+	}
+}
+
+type recordingTransport struct {
+	base    http.RoundTripper
+	gateway string
+	replay  bool
+}
+
+func (t *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	forward := req.URL.Scheme + "://" + req.URL.Host
+	if forward == "https://api.openai.com" {
+		forward += "/v1"
+	}
+	// The recorder only replays known provider origins; private endpoints stay direct.
+	if !t.replay && TargetURLForHost(forward) == nil {
+		return t.base.RoundTrip(req)
+	}
+	target, err := GatewayTargetURL(t.gateway, req)
+	if err != nil {
+		return nil, err
+	}
+	recorded := req.Clone(req.Context())
+	recorded.URL, err = url.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	recorded.Header.Set("X-Cagent-Forward", forward)
+	recorded.Header.Set("X-Cagent-Evaluator", "1")
+	if t.replay {
+		recorded.Header.Del("Authorization")
+		recorded.Header.Del("X-Api-Key")
+		recorded.Header.Del("X-Goog-Api-Key")
+		if err := httpclient.RemoveEncryptedConfig(recorded); err != nil {
+			return nil, err
+		}
+	} else {
+		recorded.Header.Set("X-Cagent-Evaluator-Recording", "1")
+	}
+	return t.base.RoundTrip(recorded)
+}
+
+// ReplayTransport routes every evaluator request to an offline cassette proxy.
+func ReplayTransport(gateway string) func(http.RoundTripper) http.RoundTripper {
+	return func(base http.RoundTripper) http.RoundTripper {
+		return &recordingTransport{base: base, gateway: gateway, replay: true}
+	}
+}
+
+// StartProxyWithOptions starts an internal HTTP proxy with configurable options.
+// - mode: recorder mode (ModeReplayOnly, ModeRecordOnce, etc.)
+// - matcher: custom matcher function (nil uses DefaultMatcher)
+// - headerUpdater: optional function to update request headers (for recording with real API keys)
+// - options: proxy options for stream simulation, etc.
+func StartProxyWithOptions(
+	ctx context.Context,
+	cassettePath string,
+	mode recorder.Mode,
+	matcher recorder.MatcherFunc,
+	headerUpdater func(host string, req *http.Request),
+	options *ProxyOptions,
+) (string, func() error, error) {
+	hasMatcher := matcher != nil
+	if !hasMatcher {
+		matcher = DefaultMatcher(nil)
+	}
+
+	if options == nil {
+		options = &ProxyOptions{}
+	}
+
+	transport, err := recorder.New(cassettePath,
+		recorder.WithMode(mode),
+		recorder.WithMatcher(matcher),
+		recorder.WithSkipRequestLatency(true),
+		recorder.WithHook(RemoveHeadersHook, recorder.AfterCaptureHook),
+		recorder.WithReplayableInteractions(false),
+	)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create VCR recorder: %w", err)
+	}
+
+	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
+	handlerOptions := *options
+	handlerOptions.ReplayOnly = mode == recorder.ModeReplayOnly
+	e.Any("/*", Handle(transport, headerUpdater, &handlerOptions))
+
+	httpServer := httptest.NewServer(e)
+
+	cleanup := func() error {
+		// Forcefully close all client connections first.
+		// This ensures any in-flight streaming requests are terminated
+		// rather than waiting for them to complete.
+		httpServer.CloseClientConnections()
+		httpServer.Close()
+
+		// Stop the VCR transport with a timeout to avoid hanging forever
+		// if there are still in-flight requests to the upstream API.
+		stopDone := make(chan error, 1)
+		go func() {
+			stopDone <- transport.Stop()
+		}()
+
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+
+		select {
+		case err := <-stopDone:
+			return err
+		case <-ctx.Done():
+			slog.WarnContext(ctx, "Recording proxy cleanup timed out, cassette may be incomplete")
+			return nil
+		}
+	}
+
+	return httpServer.URL, cleanup, nil
+}
+
+// RemoveHeadersHook strips headers from recorded interactions for security.
+func RemoveHeadersHook(i *cassette.Interaction) error {
+	i.Request.Headers = map[string][]string{}
+	i.Response.Headers = map[string][]string{}
+	return nil
+}
+
+// DefaultMatcher creates a matcher that normalizes dynamic fields for consistent matching.
+// The onError callback is called if reading the request body fails (nil logs and returns false).
+func DefaultMatcher(onError func(err error)) recorder.MatcherFunc {
+	// Normalize tool call IDs (they change between requests)
+	callIDRegex := regexp.MustCompile(`call_[a-z0-9\-]+`)
+	// Normalize max_tokens/max_output_tokens/maxOutputTokens field (varies based on models.dev
+	// cache state and provider cloning behavior). Handles both snake_case and camelCase variants.
+	maxTokensRegex := regexp.MustCompile(`"(?:max_(?:output_)?tokens|maxOutputTokens)":\d+,?`)
+	// Normalize Gemini thinkingConfig (varies based on provider defaults for thinking budget).
+	// This handles both camelCase (API) variants of the thinkingConfig field.
+	thinkingConfigRegex := regexp.MustCompile(`"thinkingConfig":\{[^}]*\},?`)
+	// Normalize OpenAI reasoning config (varies based on NoThinking flag and thinking budget).
+	reasoningRegex := regexp.MustCompile(`"reasoning":\{[^}]*\},?`)
+	// Normalize OpenAI tool_choice field. The string form ("auto", "none",
+	// "required") is now sent explicitly whenever tools are present so that
+	// strict gateways (LiteLLM) accept the request, but older cassettes were
+	// recorded without it.
+	toolChoiceRegex := regexp.MustCompile(`"tool_choice":"[^"]*",?`)
+	// Normalize prompt-file paths (they are machine-specific absolute paths).
+	promptFileRegex := regexp.MustCompile(`Instructions from: (?:[^\\"\r\n]|\\\\)+`)
+
+	return func(r *http.Request, i cassette.Request) bool {
+		if r.Body == nil || r.Body == http.NoBody {
+			return cassette.DefaultMatcher(r, i)
+		}
+		if r.Method != i.Method {
+			return false
+		}
+		if r.URL.String() != i.URL {
+			return false
+		}
+
+		reqBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			if onError != nil {
+				onError(err)
+			} else {
+				slog.Error("Failed to read request body for matching", "error", err)
+			}
+			return false
+		}
+		r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewBuffer(reqBody))
+
+		if isEvaluatorRequest(r) {
+			request, requestErr := canonicalEvaluatorBody(reqBody)
+			recorded, recordedErr := canonicalEvaluatorBody([]byte(i.Body))
+			return requestErr == nil && recordedErr == nil && bytes.Equal(request, recorded)
+		}
+
+		// Normalize dynamic fields for matching
+		normalizedReq := callIDRegex.ReplaceAllString(string(reqBody), "call_ID")
+		normalizedReq = maxTokensRegex.ReplaceAllString(normalizedReq, "")
+		normalizedReq = thinkingConfigRegex.ReplaceAllString(normalizedReq, "")
+		normalizedReq = reasoningRegex.ReplaceAllString(normalizedReq, "")
+		normalizedReq = toolChoiceRegex.ReplaceAllString(normalizedReq, "")
+		normalizedReq = promptFileRegex.ReplaceAllString(normalizedReq, "Instructions from: FILE")
+		normalizedCassette := callIDRegex.ReplaceAllString(i.Body, "call_ID")
+		normalizedCassette = maxTokensRegex.ReplaceAllString(normalizedCassette, "")
+		normalizedCassette = thinkingConfigRegex.ReplaceAllString(normalizedCassette, "")
+		normalizedCassette = reasoningRegex.ReplaceAllString(normalizedCassette, "")
+		normalizedCassette = toolChoiceRegex.ReplaceAllString(normalizedCassette, "")
+		normalizedCassette = promptFileRegex.ReplaceAllString(normalizedCassette, "Instructions from: FILE")
+
+		return normalizedReq == normalizedCassette
+	}
+}
+
+func canonicalEvaluatorBody(body []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	if fields == nil {
+		return nil, errors.New("evaluator request must be a JSON object")
+	}
+	delete(fields, httpclient.EncryptedConfigBodyField)
+	return json.Marshal(fields)
+}
+
+// TargetURLForHost returns the target URL builder for a given forwarding host.
+// Returns nil if the host is not recognized.
+func TargetURLForHost(host string) func(req *http.Request) string {
+	switch host {
+	case "https://api.openai.com/v1":
+		return func(req *http.Request) string {
+			return "https://api.openai.com" + req.URL.Redacted()
+		}
+	case "https://api.typesafe.ai":
+		return func(req *http.Request) string {
+			return "https://api.typesafe.ai" + req.URL.Redacted()
+		}
+	case "https://api.anthropic.com":
+		return func(req *http.Request) string {
+			return "https://api.anthropic.com" + req.URL.Redacted()
+		}
+	case "https://generativelanguage.googleapis.com":
+		return func(req *http.Request) string {
+			return "https://generativelanguage.googleapis.com" + req.URL.Redacted()
+		}
+	case "https://api.mistral.ai/v1":
+		return func(req *http.Request) string {
+			return "https://api.mistral.ai" + req.URL.Redacted()
+		}
+	case "https://openrouter.ai/api/v1":
+		return func(req *http.Request) string {
+			return "https://openrouter.ai/api" + req.URL.Redacted()
+		}
+	default:
+		return nil
+	}
+}
+
+// GatewayTargetURL rewrites an incoming proxy request to target the upstream
+// models gateway, appending the request path to the gateway's path and
+// merging the gateway's own query parameters (e.g. plan tiers) with the
+// request's. Both query sets are kept side by side, matching how gateway-mode
+// clients merge them (httpclient.WithQuery uses Add too).
+func GatewayTargetURL(gateway string, req *http.Request) (string, error) {
+	base, err := url.Parse(strings.TrimSuffix(gateway, "/"))
+	if err != nil {
+		return "", errors.New("invalid upstream gateway URL")
+	}
+
+	target := *base
+	target.Path = base.Path + req.URL.Path
+	target.RawPath = base.EscapedPath() + req.URL.EscapedPath()
+
+	query := base.Query()
+	for k, vs := range req.URL.Query() {
+		for _, v := range vs {
+			query.Add(k, v)
+		}
+	}
+	target.RawQuery = query.Encode()
+
+	return target.String(), nil
+}
+
+// Handle creates an echo handler that proxies requests through the VCR transport.
+// The headerUpdater is called with the host and request to update headers (e.g., for adding API keys).
+// The options parameter controls streaming simulation behavior and upstream gateway forwarding.
+func Handle(transport http.RoundTripper, headerUpdater func(host string, req *http.Request), options *ProxyOptions) echo.HandlerFunc {
+	if options == nil {
+		options = &ProxyOptions{}
+	}
+	return func(c echo.Context) error {
+		ctx := c.Request().Context()
+
+		host := c.Request().Header.Get("X-Cagent-Forward")
+		host = strings.TrimSuffix(host, "/")
+
+		toTargetURL := TargetURLForHost(host)
+
+		var targetURL, recordURL string
+		if options.UpstreamGateway != "" {
+			var err error
+			targetURL, err = GatewayTargetURL(options.UpstreamGateway, c.Request())
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+			}
+			// Record the canonical provider URL (what a gateway-less replay
+			// proxy would compute) so the cassette stays replayable and never
+			// contains the gateway URL, whose query may carry secrets.
+			if toTargetURL != nil {
+				recordURL = toTargetURL(c.Request())
+			} else {
+				hostURL, err := url.Parse(host)
+				if err != nil || hostURL.Scheme == "" || hostURL.Host == "" {
+					return echo.NewHTTPError(http.StatusBadRequest, "unknown service host "+host)
+				}
+				// Same shape as the TargetURLForHost builders: provider
+				// origin + request URI.
+				recordURL = hostURL.Scheme + "://" + hostURL.Host + c.Request().URL.Redacted()
+			}
+		} else {
+			switch {
+			case toTargetURL != nil:
+				targetURL = toTargetURL(c.Request())
+			case options.ReplayOnly:
+				u, err := url.Parse(host)
+				if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+					return echo.NewHTTPError(http.StatusBadRequest, "invalid replay origin")
+				}
+				targetURL = u.Scheme + "://" + u.Host + c.Request().URL.RequestURI()
+			default:
+				return echo.NewHTTPError(http.StatusBadRequest, "unknown service host "+host)
+			}
+		}
+
+		if recordURL != "" {
+			ctx = WithRecordURL(ctx, recordURL)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, c.Request().Method, targetURL, c.Request().Body)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to create new request")
+		}
+
+		maps.Copy(req.Header, c.Request().Header)
+
+		if headerUpdater != nil {
+			headerUpdater(host, req)
+		}
+		req.Header.Del("X-Cagent-Evaluator-Recording")
+		if !environment.IsTrustedDockerURL(options.UpstreamGateway) {
+			if err := httpclient.RemoveEncryptedConfig(req); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scrub encrypted agent config")
+			}
+		}
+
+		client := &http.Client{
+			Timeout:   0, // no timeout, let ctx control it
+			Transport: transport,
+		}
+		if isEvaluatorRequest(req) {
+			client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			// Log host+path only: in gateway mode the full target URL may
+			// carry credentials in its query string.
+			slog.ErrorContext(ctx, "VCR proxy request failed", "url", req.URL.Scheme+"://"+req.URL.Host+req.URL.Path, "error", err)
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to run request: "+err.Error())
+		}
+		defer resp.Body.Close()
+
+		maps.Copy(c.Response().Header(), resp.Header)
+
+		c.Response().WriteHeader(resp.StatusCode)
+
+		if IsStreamResponse(resp) {
+			if options.StreamEventGate != nil {
+				return gatedStreamCopy(c, resp, options.StreamEventGate)
+			}
+			if options.SimulateStream {
+				return SimulatedStreamCopy(c, resp, options.StreamChunkDelay)
+			}
+			return StreamCopy(c, resp)
+		}
+
+		_, err = io.Copy(c.Response().Writer, resp.Body)
+		return err
+	}
+}
+
+func gatedStreamCopy(c echo.Context, resp *http.Response, gate func([]byte) <-chan struct{}) error {
+	ctx := c.Request().Context()
+	reader := bufio.NewReader(resp.Body)
+	var event []byte
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		event = append(event, line...)
+		if err == nil && !bytes.Equal(line, []byte("\n")) && !bytes.Equal(line, []byte("\r\n")) {
+			continue
+		}
+		if len(event) > 0 {
+			if _, err := c.Response().Write(event); err != nil {
+				return err
+			}
+			c.Response().Flush()
+			if resume := gate(event); resume != nil {
+				select {
+				case <-resume:
+				case <-ctx.Done():
+					return nil
+				}
+			}
+			event = event[:0]
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+	}
+}
+
+// SimulatedStreamCopy copies a streaming SSE response to the client with artificial delays
+// between events to simulate real-time streaming behavior.
+func SimulatedStreamCopy(c echo.Context, resp *http.Response, chunkDelay time.Duration) error {
+	ctx := c.Request().Context()
+	writer := c.Response().Writer
+
+	reader := bufio.NewReaderSize(resp.Body, 64*1024)
+
+	// Reuse timer to avoid allocations per chunk
+	timer := time.NewTimer(chunkDelay)
+	defer timer.Stop()
+
+	dataPrefix := []byte("data:")
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.WarnContext(ctx, "client disconnected, stop streaming")
+			return nil
+		default:
+		}
+
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				// Write any remaining data without newline
+				if len(line) > 0 {
+					_, _ = writer.Write(line)
+					c.Response().Flush()
+				}
+				return nil
+			}
+			return err
+		}
+
+		// Write the line (already includes newline from ReadBytes)
+		if _, err := writer.Write(line); err != nil {
+			return err
+		}
+
+		// Add delay after data lines (SSE events start with "data:")
+		if bytes.HasPrefix(line, dataPrefix) {
+			c.Response().Flush()
+			timer.Reset(chunkDelay)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+// streamReadResult holds the result of a streaming read operation.
+type streamReadResult struct {
+	n   int64
+	err error
+}
+
+// StreamCopy copies a streaming response to the client.
+// It properly handles context cancellation during blocking reads.
+func StreamCopy(c echo.Context, resp *http.Response) error {
+	ctx := c.Request().Context()
+	writer := c.Response().Writer.(io.ReaderFrom)
+
+	// Use a channel to receive read results from a goroutine.
+	// This allows us to properly select on context cancellation
+	// even when the read is blocking.
+	resultCh := make(chan streamReadResult, 1)
+
+	for {
+		// Start a goroutine to perform the blocking read
+		go func() {
+			n, err := writer.ReadFrom(io.LimitReader(resp.Body, 256))
+			resultCh <- streamReadResult{n: n, err: err}
+		}()
+
+		// Wait for either context cancellation or read completion
+		select {
+		case <-ctx.Done():
+			slog.WarnContext(ctx, "client disconnected, stop streaming")
+			// Close the response body to unblock the read goroutine
+			resp.Body.Close()
+			<-resultCh
+			return nil
+		case result := <-resultCh:
+			if result.n > 0 {
+				c.Response().Flush() // keep flushing to client
+			}
+			if result.err != nil {
+				// io.EOF or context canceled means normal completion
+				if errors.Is(result.err, io.EOF) || ctx.Err() != nil {
+					return nil
+				}
+				slog.ErrorContext(ctx, "stream read error", "error", result.err)
+				return result.err
+			}
+			// io.Copy returns (0, nil) when the source is exhausted,
+			// not (0, io.EOF), so we need to check for this case.
+			if result.n == 0 {
+				return nil
+			}
+		}
+	}
+}
+
+// IsStreamResponse checks if the response should be streamed.
+// It checks Content-Type headers first, then falls back to peeking at the body
+// for SSE format (useful when headers are stripped in recorded cassettes).
+func IsStreamResponse(resp *http.Response) bool {
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/event-stream") {
+		return true
+	}
+
+	te := strings.ToLower(resp.Header.Get("Transfer-Encoding"))
+	if strings.Contains(te, "chunked") && !strings.Contains(ct, "application/json") {
+		return true
+	}
+
+	if strings.Contains(ct, "application/octet-stream") ||
+		strings.Contains(ct, "application/x-ndjson") ||
+		strings.Contains(ct, "application/stream+json") {
+		return true
+	}
+
+	// If no streaming headers detected, peek at the body to check for SSE format.
+	// This handles cassettes where headers were stripped during recording.
+	if resp.Body != nil {
+		// Read enough to detect SSE prefixes ("data:" or "event:")
+		peek := make([]byte, 6)
+		n, err := resp.Body.Read(peek)
+		if err == nil || n > 0 {
+			// Reconstruct the body with the peeked bytes prepended
+			resp.Body = &peekReader{peeked: peek[:n], rest: resp.Body}
+			// Check for SSE format markers
+			if bytes.HasPrefix(peek[:n], []byte("data:")) || bytes.HasPrefix(peek[:n], []byte("event:")) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// peekReader wraps a reader with already-peeked bytes.
+type peekReader struct {
+	peeked []byte
+	rest   io.ReadCloser
+}
+
+func (p *peekReader) Read(b []byte) (int, error) {
+	if len(p.peeked) > 0 {
+		n := copy(b, p.peeked)
+		p.peeked = p.peeked[n:]
+		return n, nil
+	}
+	return p.rest.Read(b)
+}
+
+func (p *peekReader) Close() error {
+	return p.rest.Close()
+}

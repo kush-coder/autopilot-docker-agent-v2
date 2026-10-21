@@ -1,0 +1,61 @@
+package anthropic
+
+import (
+	"fmt"
+	"log/slog"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/model/provider/providerutil"
+	"github.com/docker/docker-agent/pkg/modelinfo"
+)
+
+// serverSideFallbackBeta enables the `fallbacks` request parameter, which
+// lets Anthropic reroute refused requests to backup models in a single round
+// trip.
+const serverSideFallbackBeta anthropic.AnthropicBeta = "server-side-fallback-2026-06-01"
+
+// fallbackModels extracts the `fallbacks` provider_opt: a list of model IDs,
+// in priority order. Returns nil when the option is absent or malformed.
+//
+// Fallback models receive the exact same request as the primary model
+// (thinking configuration, task budget, beta features, ...), so they must
+// accept the same request shape — Anthropic rejects the fallback attempt
+// otherwise.
+func fallbackModels(opts map[string]any) []string {
+	models, ok := providerutil.GetProviderOptStringSlice(opts, "fallbacks")
+	if !ok || len(models) == 0 {
+		return nil
+	}
+	slog.Debug("Anthropic provider_opts: enabling server-side fallbacks", "models", models)
+	return models
+}
+
+// fallbacksBody returns the request option that injects the `fallbacks` body
+// field. The wire shape is [{"model": "..."}, ...].
+func fallbacksBody(models []string) option.RequestOption {
+	fallbacks := make([]map[string]string, len(models))
+	for i, m := range models {
+		fallbacks[i] = map[string]string{"model": m}
+	}
+	return option.WithJSONSet("fallbacks", fallbacks)
+}
+
+// validateFallbacks rejects server-side fallback when any model in the chain
+// is Claude 5.x: a fallback can change the serving model mid-response, which
+// the client does not handle yet. Malformed lists stay ignored, as in
+// [fallbackModels].
+func validateFallbacks(cfg *latest.ModelConfig) error {
+	fallbacks, ok := providerutil.GetProviderOptStringSlice(cfg.ProviderOpts, "fallbacks")
+	if !ok || len(fallbacks) == 0 {
+		return nil
+	}
+	for _, model := range append([]string{cfg.Model}, fallbacks...) {
+		if _, ok := modelinfo.LookupClaude5(model); ok {
+			return fmt.Errorf("anthropic: server-side fallback involving Claude 5.x model %q is not supported yet (see https://github.com/docker/docker-agent/issues/4584)", model)
+		}
+	}
+	return nil
+}

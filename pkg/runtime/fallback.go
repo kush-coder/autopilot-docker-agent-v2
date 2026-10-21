@@ -1,0 +1,587 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/backoff"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/model/provider"
+	"github.com/docker/docker-agent/pkg/modelerrors"
+	"github.com/docker/docker-agent/pkg/modelsdev"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/telemetry/genai"
+	"github.com/docker/docker-agent/pkg/tools"
+)
+
+// modelWithFallback holds a provider and its identification for logging
+type modelWithFallback struct {
+	provider   provider.Provider
+	isFallback bool
+	index      int // index in fallback list (-1 for primary)
+}
+
+// fallbackExecutor manages the model-fallback chain (primary + configured
+// fallbacks), per-attempt retry/backoff for transient errors, and the
+// per-agent "sticky" cooldown that pins the runtime to a working fallback
+// after a primary failure.
+//
+// All state that used to sit on [LocalRuntime] purely for fallback
+// purposes — the cooldown manager and the retry-on-rate-limit flag —
+// lives here. [LocalRuntime] holds a single *fallbackExecutor and
+// delegates the model-attempt loop to [fallbackExecutor.execute].
+//
+// Cooldowns are wired after options so [WithClock] is reflected.
+// [WithRetryOnRateLimit] mutates the executor directly, so the executor
+// itself must exist before opts run.
+type fallbackExecutor struct {
+	// prepareMessages applies runtime message transforms for the provider
+	// selected for each attempt. It is set by [NewLocalRuntime].
+	prepareMessages func(context.Context, *session.Session, *agent.Agent, provider.Provider, []chat.Message) []chat.Message
+
+	// retryOnRateLimit enables retry-with-backoff for HTTP 429 (rate limit)
+	// errors when no fallback models are configured. When false (default),
+	// 429 errors are treated as non-retryable and immediately fail or skip
+	// to the next model. Library consumers can enable this via
+	// [WithRetryOnRateLimit].
+	retryOnRateLimit bool
+
+	// cooldowns owns the per-agent cooldown state for sticky fallback
+	// behaviour: once a fallback succeeds following a non-retryable
+	// primary failure, we pin to that fallback for the agent's
+	// configured cooldown window before re-trying the primary.
+	//
+	// Wired in [NewLocalRuntime] after opts so the cooldown windows
+	// honour [WithClock]; safe for concurrent use.
+	cooldowns *cooldownManager
+}
+
+// newFallbackExecutor returns a *fallbackExecutor with rate-limit retries
+// off; cooldowns are wired in [NewLocalRuntime] after clock options.
+func newFallbackExecutor() *fallbackExecutor {
+	return &fallbackExecutor{}
+}
+
+type idleRetryAdmission func() error
+
+type budgetAdmissionError struct{}
+
+func (budgetAdmissionError) Error() string { return "delegated idle retry stopped by budget" }
+
+func buildModelChain(primary provider.Provider, fallbacks []provider.Provider) []modelWithFallback {
+	chain := make([]modelWithFallback, 0, 1+len(fallbacks))
+	chain = append(chain, modelWithFallback{
+		provider:   primary,
+		isFallback: false,
+		index:      -1,
+	})
+	for i, fb := range fallbacks {
+		chain = append(chain, modelWithFallback{
+			provider:   fb,
+			isFallback: true,
+			index:      i,
+		})
+	}
+	return chain
+}
+
+// logFallbackAttempt logs information about a fallback attempt
+func logFallbackAttempt(agentName string, model modelWithFallback, attempt, maxRetries int, err error) {
+	if model.isFallback {
+		slog.Warn("Fallback model attempt",
+			"agent", agentName,
+			"model", model.provider.ID().String(),
+			"fallback_index", model.index,
+			"attempt", attempt+1,
+			"max_retries", maxRetries+1,
+			"previous_error", err)
+	} else {
+		slog.Warn("Primary model failed, trying fallbacks",
+			"agent", agentName,
+			"model", model.provider.ID().String(),
+			"error", err)
+	}
+}
+
+// logRetryBackoff logs when we're backing off before a retry
+func logRetryBackoff(agentName string, modelID modelsdev.ID, attempt int, backoffDelay time.Duration) {
+	slog.Debug("Backing off before retry",
+		"agent", agentName,
+		"model", modelID.String(),
+		"attempt", attempt+1,
+		"backoff", backoffDelay)
+}
+
+// getEffectiveCooldown returns the cooldown duration to use for an agent.
+// Uses the agent's configured cooldown, or the default if not set.
+func getEffectiveCooldown(a *agent.Agent) time.Duration {
+	cooldown := a.FallbackCooldown()
+	if cooldown == 0 {
+		return modelerrors.DefaultCooldown
+	}
+	return cooldown
+}
+
+// getEffectiveRetries returns the number of retries to use for the agent.
+// If no retries are explicitly configured (retries == 0), returns
+// the default to provide sensible retry behavior out of the box.
+// This ensures that transient errors (e.g., Anthropic 529 overloaded) are
+// retried even when no fallback models are configured.
+//
+// Note: Users who explicitly want 0 retries can set retries: -1 in their config
+// (though this is an edge case - most users want some retries for resilience).
+func getEffectiveRetries(a *agent.Agent) int {
+	retries := a.FallbackRetries()
+	// -1 means "explicitly no retries" (workaround for Go's zero value)
+	if retries < 0 {
+		return 0
+	}
+	// 0 means "use default" - always provide retries for transient error resilience
+	if retries == 0 {
+		return modelerrors.DefaultRetries
+	}
+	return retries
+}
+
+// chainStartIndex returns the index in the model chain (primary at 0,
+// fallbacks at 1+) at which to begin trying. Normally 0, but during an
+// active cooldown it returns the position of the pinned fallback so the
+// primary is skipped.
+func (e *fallbackExecutor) chainStartIndex(a *agent.Agent, fallbackCount int) int {
+	state := e.cooldowns.Get(a.Name())
+	if state == nil || fallbackCount <= state.fallbackIndex {
+		return 0
+	}
+	slog.Debug("Skipping primary due to cooldown",
+		"agent", a.Name(),
+		"start_from_fallback_index", state.fallbackIndex,
+		"cooldown_until", state.until.Format(time.RFC3339))
+	// +1 to convert from a.FallbackModels() index to modelChain index
+	// (modelChain[0] is the primary, modelChain[1] is the first fallback).
+	return state.fallbackIndex + 1
+}
+
+// recordSuccess updates the per-agent cooldown state after a successful
+// model attempt. If a fallback rescued a non-retryable primary failure,
+// pin to that fallback for the cooldown window. If the primary itself
+// succeeded, clear any existing cooldown (handles both a clean primary
+// success and recovery after a cooldown expires).
+func (e *fallbackExecutor) recordSuccess(a *agent.Agent, modelEntry modelWithFallback, primaryFailedWithNonRetryable bool) {
+	switch {
+	case modelEntry.isFallback && primaryFailedWithNonRetryable:
+		e.cooldowns.Set(a.Name(), modelEntry.index, getEffectiveCooldown(a))
+	case !modelEntry.isFallback:
+		e.cooldowns.Clear(a.Name())
+	}
+}
+
+type idleStreamRetryAllowance struct {
+	remaining       bool
+	parentSessionID string
+}
+
+// idleStreamRetryPolicy is default-disabled. Callers opt in only for direct
+// transfer_task children.
+type idleStreamRetryPolicy struct {
+	enabled         bool
+	parentSessionID string
+}
+
+func defaultIdleStreamRetryPolicy() idleStreamRetryPolicy {
+	return idleStreamRetryPolicy{}
+}
+
+func (p idleStreamRetryPolicy) allowance() *idleStreamRetryAllowance {
+	return &idleStreamRetryAllowance{
+		remaining:       p.enabled,
+		parentSessionID: p.parentSessionID,
+	}
+}
+
+func isRetryableIdleStream(err error, result streamResult) bool {
+	return errors.Is(err, errStreamIdle) && !result.ResponseStarted
+}
+
+func (a *idleStreamRetryAllowance) eligible(err error, result streamResult) bool {
+	return a != nil && a.remaining && isRetryableIdleStream(err, result)
+}
+
+func (a *idleStreamRetryAllowance) consume() {
+	a.remaining = false
+}
+
+// classifyAttemptError handles an error from a stream attempt: checks for
+// context cancellation, classifies the error, and returns either a
+// per-iteration decision (retry the same model or skip to the next) or a
+// non-nil retErr that the caller must return immediately.
+//
+// This consolidates the identical error-handling block that used to
+// follow both CreateChatCompletionStream and handleStream calls.
+func (e *fallbackExecutor) classifyAttemptError(
+	ctx context.Context,
+	err error,
+	a *agent.Agent,
+	modelEntry modelWithFallback,
+	attempt int,
+	hasFallbacks bool,
+	primaryFailedWithNonRetryable *bool,
+) (decision retryDecision, retErr error) {
+	// Context cancellation is never retryable; bubble up the original
+	// error to preserve any cause/wrapping. The returned decision is
+	// irrelevant when retErr != nil — by contract the caller returns
+	// immediately — but use retryDecisionContinue rather than a magic
+	// zero so the value is at least typed and consistent.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return retryDecisionContinue, err
+	}
+	decision = e.handleModelError(ctx, err, a, modelEntry, attempt, hasFallbacks, primaryFailedWithNonRetryable)
+	if decision == retryDecisionReturn {
+		return retryDecisionContinue, ctx.Err()
+	}
+	return decision, nil
+}
+
+// execute attempts to create a stream and get a response using the primary model,
+// falling back to configured fallback models if the primary fails. When
+// idleRetry has allowance, the first idle timeout before any response payload is
+// retried immediately once across the whole delegated child run.
+//
+// Retry behavior:
+// - Retryable errors (5xx, timeouts): retry the same model with exponential backoff
+// - Non-retryable errors (429, 4xx): skip to the next model in the chain immediately
+//
+// Cooldown behavior:
+//   - When the primary fails with a non-retryable error and a fallback succeeds, the executor
+//     "sticks" with that fallback for a configurable cooldown period.
+//   - During cooldown, subsequent calls skip the primary and start from the pinned fallback.
+//   - When cooldown expires, the primary is tried again; if it succeeds, cooldown is cleared.
+//
+// Returns the stream result, the model that was used, and any error.
+func (e *fallbackExecutor) execute(
+	ctx context.Context,
+	a *agent.Agent,
+	primaryModel provider.Provider,
+	messages []chat.Message,
+	agentTools []tools.Tool,
+	sess *session.Session,
+	events EventSink,
+	idleRetry *idleStreamRetryAllowance,
+	admitIdleRetry idleRetryAdmission,
+) (streamResult, provider.Provider, error) {
+	fallbackModels := a.FallbackModels()
+	fallbackRetries := getEffectiveRetries(a)
+	modelChain := buildModelChain(primaryModel, fallbackModels)
+	startIndex := e.chainStartIndex(a, len(fallbackModels))
+
+	// One runtime.fallback span wraps the whole chain. Each per-model
+	// CreateChatCompletionStream call below opens its own `chat {model}`
+	// CLIENT child span via the provider decorator, so the fallback span
+	// is a useful aggregate boundary (total attempts, final model,
+	// terminal outcome) without duplicating per-model timing data.
+	ctx, fbSpan := genai.StartFallback(ctx, a.Name(), primaryModel.ID().Model, startIndex > 0)
+	defer fbSpan.End()
+
+	var lastErr error
+	primaryFailedWithNonRetryable := false
+	hasFallbacks := len(fallbackModels) > 0
+	// The loop announces the primary before dispatch.
+	announcedID := primaryModel.ID()
+	needsAnnouncement := false
+
+	for chainIdx := startIndex; chainIdx < len(modelChain); chainIdx++ {
+		modelEntry := modelChain[chainIdx]
+
+		announceServing := func(stream chat.MessageStream) {
+			id := modelEntry.provider.ID()
+			if serving := servingModelFrom(stream); serving != nil {
+				id = serving.ID
+			}
+			if needsAnnouncement || id != announcedID {
+				events.Emit(AgentInfo(a.Name(), id.String(), a.Description(), a.WelcomeMessage()))
+				announcedID = id
+				needsAnnouncement = false
+			}
+		}
+
+		// Each model in the chain gets (1 + retries) attempts for retryable errors.
+		// Non-retryable errors (429 with fallbacks, 4xx) skip immediately to the next model.
+		// 429 without fallbacks is retried directly on the same model.
+		maxAttempts := 1 + fallbackRetries
+
+		for attempt := range maxAttempts {
+			attemptMessages := messages
+			if e.prepareMessages != nil {
+				attemptMessages = e.prepareMessages(ctx, sess, a, modelEntry.provider, messages)
+			}
+			attemptTools := toolsForProvider(ctx, modelEntry.provider, agentTools)
+
+			// Check context before each attempt
+			if ctx.Err() != nil {
+				fbSpan.SetOutcome(genai.FallbackOutcomeContextCanceled)
+				return streamResult{}, nil, ctx.Err()
+			}
+
+			// Apply backoff before retry (not on first attempt of each model)
+			if attempt > 0 {
+				backoffDelay := backoff.Calculate(attempt - 1)
+				logRetryBackoff(a.Name(), modelEntry.provider.ID(), attempt, backoffDelay)
+				if !backoff.SleepWithContext(ctx, backoffDelay) {
+					fbSpan.SetOutcome(genai.FallbackOutcomeContextCanceled)
+					return streamResult{}, nil, ctx.Err()
+				}
+			}
+
+			// Emit fallback event when transitioning to a new model (but not when starting in cooldown)
+			if chainIdx > startIndex && attempt == 0 {
+				logFallbackAttempt(a.Name(), modelEntry, attempt, fallbackRetries, lastErr)
+				prevModelID := modelChain[chainIdx-1].provider.ID()
+				reason := ""
+				if lastErr != nil {
+					reason = lastErr.Error()
+				}
+				events.Emit(ModelFallback(
+					a.Name(),
+					prevModelID.String(),
+					modelEntry.provider.ID().String(),
+					reason,
+					attempt+1,
+					maxAttempts,
+				))
+				// Not every consumer updates its model on ModelFallback.
+				needsAnnouncement = true
+			}
+
+			slog.DebugContext(ctx, "Creating chat completion stream",
+				"agent", a.Name(),
+				"model", modelEntry.provider.ID().String(),
+				"is_fallback", modelEntry.isFallback,
+				"in_cooldown", startIndex > 0,
+				"attempt", attempt+1)
+
+			// Create a per-attempt cancellable child context so that the idle
+			// timeout in handleStream can cancel the HTTP request and unblock
+			// the goroutine reading the response body.
+			streamCtx, streamCancel := context.WithCancelCause(ctx)
+
+			// Count only requests that reach the provider dispatch boundary.
+			fbSpan.IncrementAttempt()
+			stream, err := modelEntry.provider.CreateChatCompletionStream(streamCtx, attemptMessages, attemptTools)
+			if err != nil {
+				streamCancel(nil)
+				lastErr = err
+				decision, retErr := e.classifyAttemptError(ctx, err, a, modelEntry, attempt, hasFallbacks, &primaryFailedWithNonRetryable)
+				if retErr != nil {
+					fbSpan.SetOutcome(genai.FallbackOutcomeContextCanceled)
+					return streamResult{}, nil, retErr
+				}
+				if decision == retryDecisionBreak {
+					break
+				}
+				continue
+			}
+
+			slog.DebugContext(ctx, "Processing stream", "agent", a.Name(), "model", modelEntry.provider.ID().String())
+
+			announceServing(stream)
+
+			idleTimeout := streamIdleTimeoutFor(modelEntry.provider)
+			res, err := handleStream(streamCtx, streamCancel, stream, a, attemptTools, sess, events, idleTimeout)
+			res.Serving = servingModelFrom(stream)
+			streamCancel(nil) // always release the child context
+			if err != nil {
+				lastErr = err
+				if idleRetry.eligible(err, res) && admitIdleRetry != nil {
+					if ctx.Err() != nil {
+						fbSpan.SetOutcome(genai.FallbackOutcomeContextCanceled)
+						return streamResult{}, nil, ctx.Err()
+					}
+					if err := admitIdleRetry(); err != nil {
+						fbSpan.SetOutcome(genai.FallbackOutcomeFailed)
+						return streamResult{}, nil, err
+					}
+					if ctx.Err() != nil {
+						fbSpan.SetOutcome(genai.FallbackOutcomeContextCanceled)
+						return streamResult{}, nil, ctx.Err()
+					}
+					idleRetry.consume()
+					modelID := modelEntry.provider.ID().String()
+					const retryLimit = 1
+					slog.WarnContext(ctx, "Delegated model stream idle before response; retrying immediately",
+						"agent", a.Name(),
+						"model", modelID,
+						"session_id", sess.ID,
+						"parent_session_id", idleRetry.parentSessionID,
+						"reason", "stream_idle_before_response",
+						"retry", retryLimit,
+						"limit", retryLimit,
+					)
+					events.Emit(Warning(
+						"Delegated model stream was idle before responding; retrying once.",
+						a.Name(),
+					))
+
+					streamCtx, streamCancel = context.WithCancelCause(ctx)
+					fbSpan.IncrementAttempt()
+					stream, err = modelEntry.provider.CreateChatCompletionStream(streamCtx, attemptMessages, attemptTools)
+					if err == nil {
+						announceServing(stream)
+						res, err = handleStream(streamCtx, streamCancel, stream, a, attemptTools, sess, events, idleTimeout)
+						res.Serving = servingModelFrom(stream)
+					}
+					streamCancel(nil)
+					if err == nil {
+						e.recordSuccess(a, modelEntry, primaryFailedWithNonRetryable)
+						fbSpan.SetFinalModel(finalModelFor(res.Serving, modelEntry.provider))
+						fbSpan.SetOutcome(genai.FallbackOutcomeSuccess)
+						return res, modelEntry.provider, nil
+					}
+					lastErr = err
+				}
+				decision, retErr := e.classifyAttemptError(ctx, err, a, modelEntry, attempt, hasFallbacks, &primaryFailedWithNonRetryable)
+				if retErr != nil {
+					fbSpan.SetOutcome(genai.FallbackOutcomeContextCanceled)
+					return streamResult{}, nil, retErr
+				}
+				if decision == retryDecisionBreak {
+					break
+				}
+				continue
+			}
+
+			e.recordSuccess(a, modelEntry, primaryFailedWithNonRetryable)
+			fbSpan.SetFinalModel(finalModelFor(res.Serving, modelEntry.provider))
+			fbSpan.SetOutcome(genai.FallbackOutcomeSuccess)
+			return res, modelEntry.provider, nil
+		}
+	}
+
+	// All models and retries exhausted.
+	// If the last error (or any error in the chain) was a context overflow,
+	// wrap it in a ContextOverflowError so the caller can auto-compact.
+	if lastErr != nil {
+		prefix := "model failed"
+		if hasFallbacks {
+			prefix = "all models failed"
+		}
+		wrapped := fmt.Errorf("%s: %w", prefix, lastErr)
+		fbSpan.RecordError(wrapped, "")
+		fbSpan.SetOutcome(genai.FallbackOutcomeFailed)
+		if modelerrors.IsContextOverflowError(lastErr) {
+			return streamResult{}, nil, modelerrors.NewContextOverflowError(wrapped)
+		}
+		return streamResult{}, nil, wrapped
+	}
+	unknownErr := errors.New("model failed with unknown error")
+	fbSpan.RecordError(unknownErr, "")
+	fbSpan.SetOutcome(genai.FallbackOutcomeFailed)
+	return streamResult{}, nil, unknownErr
+}
+
+// retryDecision is the outcome of handleModelError.
+type retryDecision int
+
+const (
+	// retryDecisionContinue means retry the same model (backoff already applied).
+	retryDecisionContinue retryDecision = iota
+	// retryDecisionBreak means skip to the next model in the fallback chain.
+	retryDecisionBreak
+	// retryDecisionReturn means context was cancelled; return immediately.
+	retryDecisionReturn
+)
+
+// handleModelError classifies err and decides what to do next:
+//   - retryDecisionReturn   — context cancelled while sleeping; caller returns ctx.Err()
+//   - retryDecisionBreak    — non-retryable error or 429 with fallbacks; skip to next model
+//   - retryDecisionContinue — retryable error or 429 without fallbacks; retry same model
+//
+// Side-effect: sets *primaryFailedWithNonRetryable when the primary model fails with a
+// non-retryable (or rate-limited-with-fallbacks) error.
+func (e *fallbackExecutor) handleModelError(
+	ctx context.Context,
+	err error,
+	a *agent.Agent,
+	modelEntry modelWithFallback,
+	attempt int,
+	hasFallbacks bool,
+	primaryFailedWithNonRetryable *bool,
+) retryDecision {
+	retryable, rateLimited, retryAfter := modelerrors.ClassifyModelError(err)
+
+	if rateLimited {
+		// Gate: only retry on 429 if opt-in is enabled AND no fallbacks exist.
+		// Default behavior (retryOnRateLimit=false) treats 429 as non-retryable,
+		// identical to today's behavior before this feature was added.
+		if !e.retryOnRateLimit || hasFallbacks {
+			slog.WarnContext(ctx, "Rate limited, treating as non-retryable",
+				"agent", a.Name(),
+				"model", modelEntry.provider.ID().String(),
+				"retry_on_rate_limit_enabled", e.retryOnRateLimit,
+				"has_fallbacks", hasFallbacks,
+				"error", err)
+			if !modelEntry.isFallback {
+				*primaryFailedWithNonRetryable = true
+			}
+			return retryDecisionBreak
+		}
+
+		// Opt-in enabled, no fallbacks → retry same model after honouring Retry-After (or backoff).
+		waitDuration := retryAfter
+		if waitDuration <= 0 {
+			waitDuration = backoff.Calculate(attempt)
+		} else if waitDuration > backoff.MaxRetryAfterWait {
+			slog.WarnContext(ctx, "Retry-After exceeds maximum, capping",
+				"agent", a.Name(),
+				"model", modelEntry.provider.ID().String(),
+				"retry_after", retryAfter,
+				"max", backoff.MaxRetryAfterWait)
+			waitDuration = backoff.MaxRetryAfterWait
+		}
+		slog.WarnContext(ctx, "Rate limited, retrying (opt-in enabled)",
+			"agent", a.Name(),
+			"model", modelEntry.provider.ID().String(),
+			"attempt", attempt+1,
+			"wait", waitDuration,
+			"retry_after_from_header", retryAfter > 0,
+			"error", err)
+		if !backoff.SleepWithContext(ctx, waitDuration) {
+			return retryDecisionReturn
+		}
+		return retryDecisionContinue
+	}
+
+	if !retryable {
+		slog.ErrorContext(ctx, "Non-retryable error from model",
+			"agent", a.Name(),
+			"model", modelEntry.provider.ID().String(),
+			"error", err)
+		if !modelEntry.isFallback {
+			*primaryFailedWithNonRetryable = true
+		}
+		return retryDecisionBreak
+	}
+
+	slog.WarnContext(ctx, "Retryable error from model",
+		"agent", a.Name(),
+		"model", modelEntry.provider.ID().String(),
+		"attempt", attempt+1,
+		"error", err)
+	return retryDecisionContinue
+}
+
+func finalModelFor(serving *provider.ServingModel, dispatched provider.Provider) string {
+	if serving != nil && serving.ID.Model != "" {
+		return serving.ID.Model
+	}
+	return dispatched.ID().Model
+}
+
+func servingModelFrom(stream chat.MessageStream) *provider.ServingModel {
+	if stream, ok := stream.(provider.ServingStream); ok {
+		return new(stream.ServingModel())
+	}
+	return nil
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "agent_name": "",
+    "message": { "role": "user", "content": "What is 1 + 2?" }
+  },
+  {
+    "agent_name": "root",
+    "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_IHEs9SVqo4pEXIfwFf3ksD7P",
+          "type": "function",
+          "function": { "name": "add", "arguments": "{\"a\":1,\"b\":2}" }
+        }
+      ]
+    }
+  },
+  {
+    "agent_name": "root",
+    "message": {
+      "role": "tool",
+      "content": "3",
+      "tool_call_id": "call_IHEs9SVqo4pEXIfwFf3ksD7P"
+    }
+  },
+  {
+    "agent_name": "root",
+    "message": { "role": "assistant", "content": "1 + 2 equals 3." }
+  }
+]

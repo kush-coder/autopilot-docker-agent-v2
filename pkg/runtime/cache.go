@@ -1,0 +1,176 @@
+package runtime
+
+import (
+	"context"
+	"log/slog"
+	"slices"
+	"strings"
+	"time"
+	"uuid"
+
+	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/hooks"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/telemetry/genai"
+)
+
+// BuiltinCacheResponse is the name of the builtin stop hook that persists
+// an agent's response into its configured response cache. It is
+// auto-injected by [LocalRuntime.hooksExec] when the agent has a cache
+// configured, mirroring the way [builtins.AddDate] et al. are
+// auto-injected from agent flags via [builtins.ApplyAgentDefaults].
+const BuiltinCacheResponse = "cache_response"
+
+// applyCacheDefault appends the cache_response stop hook to cfg when a
+// has a configured response cache, mirroring the role of
+// [builtins.ApplyAgentDefaults] for the runtime-private cache builtin.
+//
+// The helper accepts (and may return) a nil cfg so callers can chain
+// it after [builtins.ApplyAgentDefaults] without an extra branch.
+func applyCacheDefault(cfg *hooks.Config, a *agent.Agent) *hooks.Config {
+	if a.Cache() == nil {
+		return cfg
+	}
+	if cfg == nil {
+		cfg = &hooks.Config{}
+	}
+	cfg.Stop = append(cfg.Stop, hooks.Hook{
+		Type:    hooks.HookTypeBuiltin,
+		Command: BuiltinCacheResponse,
+	})
+	return cfg
+}
+
+// tryReplayCachedResponse looks up the latest user message in the agent's
+// response cache. On a hit it replays the cached answer as the assistant
+// message, fires stop hooks (which lets user-defined stop hooks run as
+// they would for a real response), and returns true so the caller can
+// short-circuit the run.
+//
+// The storage half of the cache is implemented as a builtin stop hook
+// (see [LocalRuntime.cacheResponseBuiltin]); the lookup half stays here
+// because no hook event currently supports short-circuiting the run with
+// a synthetic response.
+func (r *LocalRuntime) tryReplayCachedResponse(
+	ctx context.Context,
+	sess *session.Session,
+	a *agent.Agent,
+	events EventSink,
+) bool {
+	c := a.Cache()
+	if c == nil || promptHasAttachments(sess) {
+		return false
+	}
+	question := sess.GetLastUserMessageContent()
+	if question == "" {
+		return false
+	}
+	_, cacheSpan := genai.RecordCacheLookup(ctx, "")
+	cached, ok := c.Lookup(question)
+	cacheSpan.SetHit(ok && cached != "")
+	cacheSpan.End()
+	// Treat empty stored values as misses: cache_response only stores
+	// non-empty responses, so an empty entry only surfaces if the JSON
+	// file was hand-edited or downgraded from a future version. Replaying
+	// nothing would leave the user staring at a blank assistant message,
+	// so we fall through to the model instead.
+	// Older entries may contain XML tool payloads suppressed by the live stream.
+	if !ok || cached == "" || strings.Contains(cached, "<tool_call>") {
+		return false
+	}
+
+	// Tool-mode structured output only ever accepts schema-valid JSON as the
+	// final answer, so a cached entry must pass the same validation before
+	// being replayed. A stale entry (e.g. plain text stored before the agent
+	// switched to tool mode) is treated as a miss and the model is called;
+	// a valid one is replayed in its canonical compacted form. Sessions that
+	// disable structured output (fork-mode skill children) skip this and
+	// replay any cached text as-is.
+	if structuredOutputEnabled(sess, a) {
+		ot, otErr := a.StructuredOutputTool()
+		if otErr != nil {
+			// Uncompilable schema: fall through so getTools surfaces the
+			// configuration error on the regular model path.
+			return false
+		}
+		if ot != nil {
+			validated, err := ot.Validate(cached)
+			if err != nil {
+				slog.DebugContext(ctx, "Response cache hit is not valid structured output; treating as miss",
+					"agent", a.Name(), "session_id", sess.ID, "error", err)
+				return false
+			}
+			cached = validated
+		}
+	}
+
+	slog.DebugContext(ctx, "Response cache hit; replaying cached answer",
+		"agent", a.Name(), "session_id", sess.ID)
+	modelID := a.Model(ctx).ID().String()
+	events.Emit(AgentInfo(a.Name(), modelID, a.Description(), a.WelcomeMessage()))
+	messageID := uuid.NewV4().String()
+	events.Emit(AgentChoice(a.Name(), sess.ID, cached, messageID))
+	addAgentMessage(sess, a, &chat.Message{
+		MessageID: messageID,
+		Role:      chat.MessageRoleAssistant,
+		Content:   cached,
+		CreatedAt: time.Now().Format(time.RFC3339),
+		Model:     modelID,
+	}, events)
+	r.executeStopHooks(ctx, sess, a, cached, events)
+	return true
+}
+
+// cacheResponseBuiltin is the stop-hook builtin that stores the
+// assistant's response in the agent's response cache. It is registered
+// as a closure on the runtime's hooks registry so it can resolve the
+// agent (and therefore its cache instance) by name from
+// [hooks.Input.AgentName].
+//
+// The hook is a no-op when the agent has no cache configured, when the
+// dispatched input lacks a user message to key on, or when the response
+// has no visible content. Storing the same answer twice is also a no-op
+// (handled inside [cache.Cache.Store]), which makes the replay path —
+// where [LocalRuntime.tryReplayCachedResponse] fires stop hooks for the
+// cached answer — free of redundant disk writes.
+func (r *LocalRuntime) cacheResponseBuiltin(ctx context.Context, in *hooks.Input, _ []string) (*hooks.Output, error) {
+	if ctx.Value(responseCacheBypassKey{}) == true || in == nil || in.AgentName == "" || in.LastUserMessage == "" ||
+		strings.TrimSpace(in.StopResponse) == "" {
+		return nil, nil
+	}
+	a, err := r.team.Agent(in.AgentName)
+	if err != nil || a == nil {
+		slog.DebugContext(ctx, "cache_response: agent lookup failed",
+			"agent", in.AgentName, "error", err)
+		return nil, nil
+	}
+	if c := a.Cache(); c != nil {
+		// Thread the active context so the cache.store span chains
+		// onto the surrounding stop-hook trace instead of starting a
+		// detached one. Mark the operation as a successful write so
+		// the `cagent.cache.requests{operation="store"}` counter is
+		// incremented — without SetHit the store path would never
+		// register on the metric.
+		_, storeSpan := genai.RecordCacheStore(ctx, "")
+		c.Store(in.LastUserMessage, in.StopResponse)
+		storeSpan.SetHit(true)
+		storeSpan.End()
+	}
+	return nil, nil
+}
+
+type responseCacheBypassKey struct{}
+
+// The response cache keys only on text, not the payloads in MultiContent.
+func promptHasAttachments(sess *session.Session) bool {
+	for _, msg := range slices.Backward(sess.GetAllMessages()) {
+		if msg.Message.Role != chat.MessageRoleUser {
+			continue
+		}
+		return slices.ContainsFunc(msg.Message.MultiContent, func(part chat.MessagePart) bool {
+			return part.Type != chat.MessagePartTypeText
+		})
+	}
+	return false
+}

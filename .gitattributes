@@ -1,0 +1,32 @@
+# Auto detect text files and normalize to LF
+* text=auto eol=lf
+
+# Go source files
+*.go text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Windows specific files
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+
+# Bot-refreshed weekly by task update-models
+pkg/modelsdev/snapshot.json linguist-generated=true -diff
+pkg/modelsdev/snapshot_date.txt linguist-generated=true -diff

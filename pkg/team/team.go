@@ -1,0 +1,212 @@
+package team
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"strings"
+
+	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/config/types"
+	"github.com/docker/docker-agent/pkg/evaluator"
+	"github.com/docker/docker-agent/pkg/permissions"
+)
+
+type Team struct {
+	agents      []*agent.Agent
+	evaluators  map[string]evaluator.Evaluator
+	permissions *permissions.Checker
+	// runtimeSafety is the config-wide safety-mode default declared under
+	// runtime.safety, retained so session constructors can apply it when
+	// neither the user nor the selected agent chose a mode. Empty when the
+	// config declares none (or the team was built without a config).
+	runtimeSafety latest.SafetyMode
+	// agentConfigs holds the raw resolved config for each agent, keyed by
+	// name. It is retained only when the team is built from a config file
+	// (WithAgentConfigs) so surfaces like the agent inspector can show
+	// declared toolset allow-lists, limits and flags. Teams built without it
+	// (e.g. the remote runtime) leave it nil and AgentConfig returns false.
+	agentConfigs map[string]latest.AgentConfig
+}
+
+type Opt func(*Team)
+
+func WithAgents(agents ...*agent.Agent) Opt {
+	return func(t *Team) {
+		t.agents = agents
+	}
+}
+
+func WithPermissions(checker *permissions.Checker) Opt {
+	return func(t *Team) {
+		t.permissions = checker
+	}
+}
+
+// WithAgentConfigs retains the per-agent resolved configs (keyed by agent
+// name) on the team. They are read-only reference data used by inspection
+// surfaces; the runtime continues to operate on the resolved *agent.Agent.
+func WithAgentConfigs(configs map[string]latest.AgentConfig) Opt {
+	return func(t *Team) {
+		t.agentConfigs = configs
+	}
+}
+
+// WithRuntimeSafety records the config-wide runtime.safety default the
+// team was loaded with.
+func WithRuntimeSafety(mode latest.SafetyMode) Opt {
+	return func(t *Team) {
+		t.runtimeSafety = mode
+	}
+}
+
+func New(opts ...Opt) *Team {
+	t := &Team{}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
+}
+
+func (t *Team) AgentNames() []string {
+	var names []string
+	for i := range t.agents {
+		names = append(names, t.agents[i].Name())
+	}
+	return names
+}
+
+// AgentInfo contains information about an agent
+type AgentInfo struct {
+	Name        string
+	Description string
+	Provider    string
+	Model       string
+	Commands    types.Commands
+}
+
+// AgentsInfo returns information about all agents in the team
+func (t *Team) AgentsInfo(ctx context.Context) []AgentInfo {
+	var infos []AgentInfo
+	for _, a := range t.agents {
+		info := AgentInfo{
+			Name:        a.Name(),
+			Description: a.Description(),
+			Commands:    a.Commands(),
+		}
+		if model := a.Model(ctx); model != nil {
+			id := model.ID()
+			info.Provider = id.Provider
+			info.Model = id.Model
+		} else if harnessType := a.HarnessType(); harnessType != "" {
+			// Harness-backed agents have no provider.Provider; surface the
+			// harness type (e.g. "claude-code") as the display model and leave
+			// Thinking empty so no badge/card line is shown.
+			info.Model = harnessType
+		}
+		infos = append(infos, info)
+	}
+	return infos
+}
+
+func (t *Team) DefaultAgent() (*agent.Agent, error) {
+	if t.Size() == 0 {
+		return nil, errors.New("no agents loaded; ensure your agent configuration defines at least one agent")
+	}
+
+	// Before v4, the default agent was the one named "root". If it exists, return it.
+	for _, a := range t.agents {
+		if a.Name() == "root" {
+			return a, nil
+		}
+	}
+
+	// Otherwise, return the first agent.
+	return t.agents[0], nil
+}
+
+func (t *Team) Agent(name string) (*agent.Agent, error) {
+	if t.Size() == 0 {
+		return nil, errors.New("no agents loaded; ensure your agent configuration defines at least one agent")
+	}
+
+	for _, a := range t.agents {
+		if a.Name() == name {
+			return a, nil
+		}
+	}
+
+	return nil, fmt.Errorf("agent not found: %s (available agents: %s)", name, strings.Join(t.AgentNames(), ", "))
+}
+
+// AgentOrDefault returns the agent identified by name, or the team's
+// [DefaultAgent] when name is empty. It is a convenience for the many
+// call sites that accept an optional agent selector (CLI flag, HTTP
+// route, ...) and want "empty means whatever the team considers
+// default" semantics without sprinkling the same `if name == ""` check
+// everywhere.
+func (t *Team) AgentOrDefault(name string) (*agent.Agent, error) {
+	if name == "" {
+		return t.DefaultAgent()
+	}
+	return t.Agent(name)
+}
+
+func (t *Team) Size() int {
+	return len(t.agents)
+}
+
+func (t *Team) StopToolSets(ctx context.Context) error {
+	var errs []error
+	for _, agent := range t.agents {
+		// One agent failing to stop (e.g. a wedged toolset) must not leave
+		// later agents' toolsets running: keep stopping and aggregate.
+		if err := agent.StopToolSets(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop tool sets of agent %s: %w", agent.Name(), err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// AgentConfig returns the raw resolved config for the named agent and true
+// when it was retained at construction (WithAgentConfigs). Teams built
+// without configs (e.g. the remote runtime) return the zero value and false,
+// letting callers gracefully omit config-derived detail.
+func (t *Team) AgentConfig(name string) (latest.AgentConfig, bool) {
+	cfg, ok := t.agentConfigs[name]
+	return cfg, ok
+}
+
+// Permissions returns the permission checker for this team.
+// Returns nil if no permissions are configured.
+func (t *Team) Permissions() *permissions.Checker {
+	return t.permissions
+}
+
+// RuntimeSafety returns the config-wide safety-mode default declared under
+// runtime.safety, or empty when the config declares none. It is a default
+// only: user-owned choices and per-agent safety take precedence.
+func (t *Team) RuntimeSafety() latest.SafetyMode {
+	return t.runtimeSafety
+}
+
+// SetPermissions replaces the team's permission checker.
+// This is used to merge additional permission sources (e.g. user-level global
+// permissions) into the team's checker after construction.
+func (t *Team) SetPermissions(checker *permissions.Checker) {
+	t.permissions = checker
+}
+
+// WithEvaluators installs reusable, provider-backed assessments for this team.
+func WithEvaluators(evaluators map[string]evaluator.Evaluator) Opt {
+	return func(t *Team) { t.evaluators = maps.Clone(evaluators) }
+}
+
+// Evaluator returns the named assessment shared by the team's agents.
+func (t *Team) Evaluator(name string) (evaluator.Evaluator, bool) {
+	e, ok := t.evaluators[name]
+	return e, ok
+}

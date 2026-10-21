@@ -1,0 +1,392 @@
+package root
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/docker/cli/cli"
+	"github.com/docker/cli/cli-plugins/metadata"
+	"github.com/docker/cli/cli-plugins/plugin"
+	"github.com/docker/cli/cli/command"
+	"github.com/spf13/cobra"
+
+	"github.com/docker/docker-agent/pkg/codingharness"
+	"github.com/docker/docker-agent/pkg/feedback"
+	"github.com/docker/docker-agent/pkg/logging"
+	pathx "github.com/docker/docker-agent/pkg/path"
+	"github.com/docker/docker-agent/pkg/paths"
+	"github.com/docker/docker-agent/pkg/runtime"
+	"github.com/docker/docker-agent/pkg/runtime/jscommands"
+	"github.com/docker/docker-agent/pkg/selfupdate"
+	"github.com/docker/docker-agent/pkg/telemetry"
+	"github.com/docker/docker-agent/pkg/tools/builtin/shell"
+	"github.com/docker/docker-agent/pkg/tools/mcp/keyringstore"
+	"github.com/docker/docker-agent/pkg/version"
+)
+
+type rootFlags struct {
+	enableOtel  bool
+	debugMode   bool
+	logFilePath string
+	logFile     io.Closer
+	cacheDir    string
+	configDir   string
+	dataDir     string
+}
+
+const (
+	envConfigDir       = "DOCKER_AGENT_CONFIG_DIR"
+	cagentEnvConfigDir = "CAGENT_CONFIG_DIR"
+	envDataDir         = "DOCKER_AGENT_DATA_DIR"
+)
+
+// resolveConfigDir picks the config directory override with flag > env >
+// default precedence. The env fallbacks let external tools point docker-agent
+// at a non-default config dir (e.g. to locate hooks.d) without controlling
+// its argv.
+func resolveConfigDir(flagValue string) string {
+	return cmp.Or(flagValue, os.Getenv(envConfigDir), os.Getenv(cagentEnvConfigDir))
+}
+
+func resolveDataDir(flagValue string) (string, error) {
+	return pathx.ExpandHomeDir(cmp.Or(flagValue, os.Getenv(envDataDir)))
+}
+
+func NewRootCmd() *cobra.Command {
+	var flags rootFlags
+
+	cmd := &cobra.Command{
+		Use:   "docker-agent",
+		Short: "Docker AI Agent Runner",
+		Long: `Docker AI Agent Runner.
+
+New to docker agent? Take the hands-on tour: docker agent getting-started`,
+		Example: `  docker-agent run
+  docker-agent run ./agent.yaml`,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Apply directory overrides before anything else so that
+			// logging, telemetry, and config loading honour them.
+			if dir := flags.cacheDir; dir != "" {
+				paths.SetCacheDir(dir)
+			}
+			if dir := resolveConfigDir(flags.configDir); dir != "" {
+				paths.SetConfigDir(dir)
+			}
+			dataDir, err := resolveDataDir(flags.dataDir)
+			if err != nil {
+				return fmt.Errorf("resolving data directory: %w", err)
+			}
+			if dataDir != "" {
+				paths.SetDataDir(dataDir)
+			}
+
+			// Set the version for automatic telemetry initialization
+			telemetry.SetGlobalTelemetryVersion(version.Version)
+
+			// Print startup message only on first installation/setup
+			if isFirstRun() && os.Getenv("CAGENT_HIDE_TELEMETRY_BANNER") != "1" && os.Getenv("DOCKER_AGENT_HIDE_TELEMETRY_BANNER") != "1" {
+				welcomeMsg := fmt.Sprintf(`
+Welcome to docker agent! 🚀
+
+For any feedback, please visit: %s
+`, feedback.Link)
+				fmt.Fprint(cmd.ErrOrStderr(), welcomeMsg)
+
+				// Only show telemetry notice when telemetry is enabled
+				if telemetry.GetTelemetryEnabled() {
+					telemetryMsg := `
+We collect anonymous usage data to help improve docker agent. To disable:
+  - Set environment variable: TELEMETRY_ENABLED=false
+`
+					fmt.Fprint(cmd.ErrOrStderr(), telemetryMsg)
+				}
+
+				fmt.Fprintln(cmd.ErrOrStderr())
+			}
+
+			// Initialize logging before anything else so logs don't break TUI
+			if err := flags.setupLogging(); err != nil {
+				// If logging setup fails, fall back to stderr so we still get logs
+				slog.SetDefault(slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{
+					Level: func() slog.Level {
+						if flags.debugMode {
+							return slog.LevelDebug
+						}
+						return slog.LevelInfo
+					}(),
+				})))
+			}
+
+			telemetry.SetGlobalTelemetryDebugMode(flags.debugMode)
+
+			if flags.enableOtel {
+				if err := initOTelSDK(cmd.Context()); err != nil {
+					slog.Warn("Failed to initialize OpenTelemetry SDK", "error", err)
+				} else {
+					slog.Debug("OpenTelemetry SDK initialized successfully")
+				}
+			}
+
+			return nil
+		},
+		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+			if flags.logFile != nil {
+				if err := flags.logFile.Close(); err != nil {
+					slog.Error("Failed to close log file", "error", err)
+				}
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Default to "run" command
+			if len(args) == 0 {
+				runCmd, _, _ := cmd.Find([]string{"run"})
+				if err := runCmd.PersistentPreRunE(runCmd, nil); err != nil {
+					return err
+				}
+				return runCmd.RunE(runCmd, nil)
+			}
+
+			// Or print help
+			if args[0] == "help" {
+				return cmd.Help()
+			}
+
+			// Or print help and an unknown command error
+			_ = cmd.Help()
+			return cli.StatusError{
+				StatusCode: 1,
+				Status:     fmt.Sprintf("ERROR: unknown command: %q", args[0]),
+			}
+		},
+		SilenceUsage: true,
+	}
+
+	// Add persistent debug flag available to all commands
+	cmd.PersistentFlags().BoolVarP(&flags.debugMode, "debug", "d", false, "Enable debug logging")
+	cmd.PersistentFlags().BoolVarP(&flags.enableOtel, "otel", "o", false, "Enable OpenTelemetry tracing")
+	cmd.PersistentFlags().StringVar(&flags.logFilePath, "log-file", "", "Path to debug log file (default: ~/.cagent/cagent.debug.log; only used with --debug)")
+	cmd.PersistentFlags().StringVar(&flags.cacheDir, "cache-dir", "", "Override the cache directory (default: ~/Library/Caches/cagent on macOS)")
+	cmd.PersistentFlags().StringVar(&flags.configDir, "config-dir", "", "Override the config directory (default: ~/.config/cagent)")
+	cmd.PersistentFlags().StringVar(&flags.dataDir, "data-dir", "", "Override the data directory (default: ~/.cagent; env: DOCKER_AGENT_DATA_DIR)")
+
+	// Define groups
+	cmd.AddGroup(
+		&cobra.Group{ID: "core", Title: "Core Commands:"},
+		&cobra.Group{ID: "diagnose", Title: "Diagnose Commands:"},
+		&cobra.Group{ID: "advanced", Title: "Advanced Commands:"},
+	)
+
+	cmd.AddCommand(
+		newVersionCmd(),
+		newRunCmd(),
+		newNewCmd(),
+		newGettingStartedCmd(),
+		newEvalCmd(),
+		newSessionsCmd(),
+		newShareCmd(),
+		newModelsCmd(),
+		newToolsetsCmd(),
+		newSetupCmd(),
+		newDoctorCmd(),
+		newDebugCmd(),
+		newAliasCmd(),
+		newPlansCmd(),
+		newSandboxCmd(),
+		newBoardCmd(),
+		newServeCmd(),
+		newAskpassCmd(),
+	)
+
+	return cmd
+}
+
+func Execute(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) error {
+	// Back MCP OAuth with the OS keyring for the CLI. Embedders that don't
+	// import cmd/root keep the default in-memory store.
+	keyringstore.Register()
+	// Enable ${...} JavaScript expressions in slash-command instructions.
+	jscommands.Register()
+	// Enable `harness:` agents backed by external coding CLIs.
+	runtime.RegisterHarness(codingharness.Factory)
+
+	selfupdate.Cleanup(ctx)
+
+	// Opt-in self-update: when enabled, replace this binary with the latest
+	// release and re-exec before doing any real work. Skipped for invocations
+	// where restarting would be wrong (plugin metadata handshake, shell
+	// completion) and always falls back to the current binary on any failure.
+	if selfupdate.Enabled() && !isManagementInvocation(args) {
+		selfupdate.Run(ctx, stdin, stderr)
+	}
+
+	rootCmd := NewRootCmd()
+	rootCmd.SetIn(stdin)
+	rootCmd.SetOut(stdout)
+	rootCmd.SetErr(stderr)
+	rootCmd.SetArgs(args)
+
+	runningStandalone := plugin.RunningStandalone()
+	if runningStandalone {
+		var err error
+		ctx, err = withDMRDockerConnection(ctx, nil, nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	visitAll(rootCmd, func(cmd *cobra.Command) {
+		cmd.SetContext(ctx)
+		if !runningStandalone {
+			cmd.Example = strings.ReplaceAll(cmd.Example, "docker-agent", "docker agent")
+		}
+	})
+
+	// The hidden __askpass helper is always invoked directly (sudo execs the
+	// generated wrapper, which execs this binary), but it inherits the docker
+	// CLI plugin reexec env, which would otherwise route it through the plugin
+	// framework and print docker usage to stdout — corrupting the password
+	// sudo reads. Force the standalone cobra path so the subcommand dispatches.
+	if runningStandalone || isAskpassInvocation(args) {
+		return rootCmd.Execute()
+	}
+
+	plugin.Run(func(dockerCLI command.Cli) *cobra.Command {
+		// Force to the name of the docker command
+		rootCmd.Use = "agent"
+
+		// Force default usage template. Otherwise it gets overridden by docker's.
+		rootCmd.SetUsageTemplate(rootCmd.UsageTemplate())
+
+		originalPreRun := rootCmd.PersistentPreRunE
+		rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+			if err := plugin.PersistentPreRunE(cmd, args); err != nil {
+				return err
+			}
+			dmrCtx, err := withDMRDockerConnection(cmd.Context(), dockerCLI, cmd.Root().Flags())
+			if err != nil {
+				return err
+			}
+			visitAll(rootCmd, func(c *cobra.Command) { c.SetContext(dmrCtx) })
+			if originalPreRun != nil {
+				return originalPreRun(cmd, args)
+			}
+			return nil
+		}
+		return rootCmd
+	}, metadata.Metadata{
+		SchemaVersion: "0.1.0",
+		Vendor:        "Docker Inc.",
+		Version:       version.Version,
+	})
+
+	return nil
+}
+
+func visitAll(cmd *cobra.Command, fn func(*cobra.Command)) {
+	fn(cmd)
+	for _, cmd := range cmd.Commands() {
+		visitAll(cmd, fn)
+	}
+}
+
+// isManagementInvocation reports whether args correspond to an invocation that
+// must not trigger a self-update + restart: the docker CLI plugin metadata
+// handshake, shell-completion script generation, and the version/help queries.
+// Updating mid-handshake would corrupt the plugin protocol, and restarting a
+// completion call would be surprising.
+//
+// Help and version are detected anywhere in args, not just at args[0], so that
+// per-subcommand help (e.g. "run --help") is also skipped.
+// isAskpassInvocation reports whether args invoke the hidden sudo askpass
+// helper. It must dispatch through the standalone cobra path even when the
+// docker CLI plugin reexec env is inherited (see Execute).
+func isAskpassInvocation(args []string) bool {
+	return len(args) > 0 && args[0] == shell.AskpassCommandName
+}
+
+func isManagementInvocation(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case metadata.MetadataSubcommandName, cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd, "completion", "version", "help", "--version", shell.AskpassCommandName:
+		return true
+	}
+	// A help request can appear after a subcommand ("run --help"); never update
+	// just to print help text.
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
+}
+
+// setupLogging configures slog logging behavior.
+// When --debug is enabled, logs are written to a rotating file <dataDir>/cagent.debug.log,
+// or to the file specified by --log-file. Log files are rotated when they exceed 10MB,
+// keeping up to 3 backup files.
+func (f *rootFlags) setupLogging() error {
+	if !f.debugMode {
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+		return nil
+	}
+
+	path := cmp.Or(strings.TrimSpace(f.logFilePath), filepath.Join(paths.GetDataDir(), "cagent.debug.log"))
+
+	logFile, err := logging.NewRotatingFile(path)
+	if err != nil {
+		return err
+	}
+	f.logFile = logFile
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	return nil
+}
+
+// RuntimeError wraps runtime errors to distinguish them from usage errors
+type RuntimeError struct {
+	Err error
+}
+
+func (e RuntimeError) Error() string {
+	return e.Err.Error()
+}
+
+func (e RuntimeError) Unwrap() error {
+	return e.Err
+}
+
+// isFirstRun checks if this is the first time docker agent is being run.
+// It atomically creates a marker file in the user's config directory
+// using os.O_EXCL to avoid a race condition when multiple processes
+// start concurrently.
+func isFirstRun() bool {
+	configDir := paths.GetConfigDir()
+	markerFile := filepath.Join(configDir, ".cagent_first_run")
+
+	// Ensure the config directory exists before trying to create the marker file
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		slog.Warn("Failed to create config directory for first run marker", "error", err)
+		return false
+	}
+
+	// Atomically create the marker file. If it already exists, OpenFile returns an error.
+	f, err := os.OpenFile(markerFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // empty marker file with no sensitive content
+	if err != nil {
+		return false // File already exists or other error, not first run
+	}
+	if err := f.Close(); err != nil {
+		slog.Warn("Failed to close first run marker file", "error", err)
+	}
+
+	return true
+}

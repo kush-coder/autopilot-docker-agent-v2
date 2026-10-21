@@ -1,0 +1,274 @@
+package toolexec
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/docker/docker-agent/pkg/tools"
+	bgagent "github.com/docker/docker-agent/pkg/tools/builtin/agent"
+	"github.com/docker/docker-agent/pkg/tools/builtin/backgroundjobs"
+)
+
+func TestLoopDetector(t *testing.T) {
+	t.Parallel()
+	makeCalls := func(pairs ...string) []tools.ToolCall {
+		var calls []tools.ToolCall
+		for i := 0; i < len(pairs); i += 2 {
+			calls = append(calls, tools.ToolCall{
+				Function: tools.FunctionCall{
+					Name:      pairs[i],
+					Arguments: pairs[i+1],
+				},
+			})
+		}
+		return calls
+	}
+
+	tests := []struct {
+		name        string
+		threshold   int
+		exemptTools []string
+		batches     [][]tools.ToolCall
+		wantTrip    bool // whether any record call returns true
+		wantCount   int
+	}{
+		{
+			name:      "no loop with varied calls",
+			threshold: 3,
+			batches: [][]tools.ToolCall{
+				makeCalls("read_file", `{"path":"a.txt"}`),
+				makeCalls("read_file", `{"path":"b.txt"}`),
+				makeCalls("write_file", `{"path":"c.txt"}`),
+			},
+			wantTrip:  false,
+			wantCount: 1,
+		},
+		{
+			name:      "loop detected at exact threshold",
+			threshold: 3,
+			batches: [][]tools.ToolCall{
+				makeCalls("read_file", `{"path":"a.txt"}`),
+				makeCalls("read_file", `{"path":"a.txt"}`),
+				makeCalls("read_file", `{"path":"a.txt"}`),
+			},
+			wantTrip:  true,
+			wantCount: 3,
+		},
+		{
+			name:      "counter resets when calls change",
+			threshold: 3,
+			batches: [][]tools.ToolCall{
+				makeCalls("read_file", `{"path":"a.txt"}`),
+				makeCalls("read_file", `{"path":"a.txt"}`),
+				makeCalls("read_file", `{"path":"b.txt"}`), // reset
+				makeCalls("read_file", `{"path":"b.txt"}`),
+			},
+			wantTrip:  false,
+			wantCount: 2,
+		},
+		{
+			name:      "empty calls never trigger",
+			threshold: 2,
+			batches: [][]tools.ToolCall{
+				{},
+				{},
+				{},
+			},
+			wantTrip:  false,
+			wantCount: 0,
+		},
+		{
+			name:      "multi-tool batches compared correctly",
+			threshold: 2,
+			batches: [][]tools.ToolCall{
+				makeCalls("read_file", `{"path":"a"}`, "write_file", `{"path":"b"}`),
+				makeCalls("read_file", `{"path":"a"}`, "write_file", `{"path":"b"}`),
+			},
+			wantTrip:  true,
+			wantCount: 2,
+		},
+		{
+			name:      "multi-tool batches differ by one argument",
+			threshold: 2,
+			batches: [][]tools.ToolCall{
+				makeCalls("read_file", `{"path":"a"}`, "write_file", `{"path":"b"}`),
+				makeCalls("read_file", `{"path":"a"}`, "write_file", `{"path":"c"}`),
+			},
+			wantTrip:  false,
+			wantCount: 1,
+		},
+		{
+			name:      "reordered JSON keys are treated as identical",
+			threshold: 2,
+			batches: [][]tools.ToolCall{
+				makeCalls("run", `{"cmd":"ls","cwd":"/tmp"}`),
+				makeCalls("run", `{"cwd":"/tmp","cmd":"ls"}`),
+			},
+			wantTrip:  true,
+			wantCount: 2,
+		},
+		{
+			name:      "nested JSON key reordering is normalized",
+			threshold: 2,
+			batches: [][]tools.ToolCall{
+				makeCalls("call", `{"a":{"y":2,"x":1},"b":1}`),
+				makeCalls("call", `{"b":1,"a":{"x":1,"y":2}}`),
+			},
+			wantTrip:  true,
+			wantCount: 2,
+		},
+		{
+			name:        "exempt background agent polling does not count as a loop",
+			threshold:   2,
+			exemptTools: []string{bgagent.ToolNameViewBackgroundAgent},
+			batches: [][]tools.ToolCall{
+				makeCalls(bgagent.ToolNameViewBackgroundAgent, `{"task_id":"agent_task_123"}`),
+				makeCalls(bgagent.ToolNameViewBackgroundAgent, `{"task_id":"agent_task_123"}`),
+				makeCalls(bgagent.ToolNameViewBackgroundAgent, `{"task_id":"agent_task_123"}`),
+			},
+			wantTrip:  false,
+			wantCount: 0,
+		},
+		{
+			name:        "repeated background agent joins do not count as a loop",
+			threshold:   2,
+			exemptTools: []string{bgagent.ToolNameWaitBackgroundAgents},
+			batches: [][]tools.ToolCall{
+				makeCalls(bgagent.ToolNameWaitBackgroundAgents, `{"task_ids":["task1","task2"]}`),
+				makeCalls(bgagent.ToolNameWaitBackgroundAgents, `{"task_ids":["task1","task2"]}`),
+				makeCalls(bgagent.ToolNameWaitBackgroundAgents, `{"task_ids":["task1","task2"]}`),
+			},
+			wantTrip:  false,
+			wantCount: 0,
+		},
+		{
+			name:        "mixed batch with exempt and non exempt tools still counts",
+			threshold:   2,
+			exemptTools: []string{bgagent.ToolNameViewBackgroundAgent, backgroundjobs.ToolNameViewBackgroundJob},
+			batches: [][]tools.ToolCall{
+				makeCalls(bgagent.ToolNameViewBackgroundAgent, `{"task_id":"agent_task_123"}`, "read_file", `{"path":"a.txt"}`),
+				makeCalls(bgagent.ToolNameViewBackgroundAgent, `{"task_id":"agent_task_123"}`, "read_file", `{"path":"a.txt"}`),
+			},
+			wantTrip:  true,
+			wantCount: 2,
+		},
+		{
+			name:        "exempt shell background job polling does not count as a loop",
+			threshold:   2,
+			exemptTools: []string{backgroundjobs.ToolNameViewBackgroundJob},
+			batches: [][]tools.ToolCall{
+				makeCalls(backgroundjobs.ToolNameViewBackgroundJob, `{"job_id":"job_1"}`),
+				makeCalls(backgroundjobs.ToolNameViewBackgroundJob, `{"job_id":"job_1"}`),
+			},
+			wantTrip:  false,
+			wantCount: 0,
+		},
+		{
+			// list_background_agents is zero-arg, so every call is byte-identical.
+			// That makes it the textbook trigger for the consecutive-duplicate
+			// killer — but it's also the natural reach-for tool when a model
+			// has lost track of task IDs and needs to re-discover them. The
+			// runtime exempts it for the same reason it exempts the view_*
+			// tools: polling status is a legitimate, expected pattern.
+			name:        "exempt list_background_agents polling does not count as a loop",
+			threshold:   2,
+			exemptTools: []string{bgagent.ToolNameListBackgroundAgents},
+			batches: [][]tools.ToolCall{
+				makeCalls(bgagent.ToolNameListBackgroundAgents, `{}`),
+				makeCalls(bgagent.ToolNameListBackgroundAgents, `{}`),
+				makeCalls(bgagent.ToolNameListBackgroundAgents, `{}`),
+			},
+			wantTrip:  false,
+			wantCount: 0,
+		},
+		{
+			// A looping model cannot evade detection by interleaving a single
+			// polling call between identical non-exempt calls. Exempt calls are
+			// completely invisible to the detector and do NOT reset the counter.
+			name:        "interleaved polling does not evade loop detection",
+			threshold:   3,
+			exemptTools: []string{bgagent.ToolNameViewBackgroundAgent},
+			batches: [][]tools.ToolCall{
+				makeCalls("read_file", `{"path":"a.txt"}`),
+				makeCalls("read_file", `{"path":"a.txt"}`),
+				makeCalls(bgagent.ToolNameViewBackgroundAgent, `{"task_id":"t1"}`), // exempt — counter stays at 2
+				makeCalls("read_file", `{"path":"a.txt"}`),                         // consecutive=3 → trips
+			},
+			wantTrip:  true,
+			wantCount: 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewLoopDetector(tt.threshold, tt.exemptTools...)
+			var tripped bool
+			for _, batch := range tt.batches {
+				if d.Record(batch) {
+					tripped = true
+				}
+			}
+			if tripped != tt.wantTrip {
+				t.Errorf("tripped = %v, want %v", tripped, tt.wantTrip)
+			}
+			if d.Consecutive() != tt.wantCount {
+				t.Errorf("consecutive = %d, want %d", d.Consecutive(), tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestToolLoopDetector_Reset(t *testing.T) {
+	t.Parallel()
+	calls := []tools.ToolCall{{
+		Function: tools.FunctionCall{Name: "read_file", Arguments: `{"path":"a.txt"}`},
+	}}
+
+	d := NewLoopDetector(3)
+	d.Record(calls)
+	d.Record(calls)
+	if d.Consecutive() != 2 {
+		t.Fatalf("consecutive = %d, want 2 before reset", d.Consecutive())
+	}
+	if d.lastSignature == "" {
+		t.Fatalf("lastSignature should be populated before reset")
+	}
+
+	d.Reset()
+
+	if d.Consecutive() != 0 {
+		t.Errorf("consecutive = %d, want 0 after reset", d.Consecutive())
+	}
+	if d.lastSignature != "" {
+		t.Errorf("lastSignature = %q, want empty after reset", d.lastSignature)
+	}
+
+	// After reset, identical calls should restart counting from 1, not
+	// continue from the pre-reset count.
+	if tripped := d.Record(calls); tripped {
+		t.Errorf("detector tripped on first call after reset; counter not cleared")
+	}
+	if d.Consecutive() != 1 {
+		t.Errorf("consecutive = %d, want 1 after first record post-reset", d.Consecutive())
+	}
+}
+
+func TestLoopDetectorSuccessfulCallExemptions(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(2, "poll")
+	draw := tools.ToolCall{ID: "draw", Function: tools.FunctionCall{Name: "random_int", Arguments: `{"min":1,"max":6}`}}
+	poll := tools.ToolCall{ID: "poll", Function: tools.FunctionCall{Name: "poll"}}
+	other := tools.ToolCall{ID: "other", Function: tools.FunctionCall{Name: "other"}}
+
+	assert.False(t, d.Record([]tools.ToolCall{draw}))
+	assert.False(t, d.Record([]tools.ToolCall{draw}, draw.ID))
+	assert.False(t, d.Record([]tools.ToolCall{draw, poll}, draw.ID))
+	assert.Equal(t, 1, d.Consecutive(), "successful draws and polling do not reset the failed-call count")
+	assert.True(t, d.Record([]tools.ToolCall{draw}))
+
+	d.Reset()
+	assert.False(t, d.Record([]tools.ToolCall{draw, other}, draw.ID))
+	assert.True(t, d.Record([]tools.ToolCall{draw, other}, draw.ID), "mixed batches still count")
+}

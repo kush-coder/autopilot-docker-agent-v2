@@ -1,0 +1,1234 @@
+package session
+
+import (
+	"database/sql"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/chat"
+)
+
+func TestStoreAgentName(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_store.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	testAgent1 := agent.New("test-agent-1", "test prompt 1")
+	testAgent2 := agent.New("test-agent-2", "test prompt 2")
+
+	session := &Session{
+		ID: "test-session",
+		Messages: []Item{
+			NewMessageItem(UserMessage("Hello")),
+			NewMessageItem(NewAgentMessage(testAgent1.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Hello from test-agent-1",
+			})),
+			NewMessageItem(NewAgentMessage(testAgent2.Name(), &chat.Message{
+				Role:    chat.MessageRoleUser,
+				Content: "Another message from test-agent-2",
+			})),
+		},
+		InputTokens:  100,
+		OutputTokens: 200,
+		CreatedAt:    time.Now(),
+	}
+
+	// Store the session
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve the session
+	retrievedSession, err := store.GetSession(t.Context(), "test-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrievedSession)
+
+	assert.Len(t, retrievedSession.GetAllMessages(), 3)
+
+	// First message should be user message with empty agent name
+	assert.Empty(t, retrievedSession.Messages[0].Message.AgentName)
+	assert.Equal(t, "Hello", retrievedSession.Messages[0].Message.Message.Content)
+
+	// Second message should have the first agent's name
+	assert.Equal(t, "test-agent-1", retrievedSession.Messages[1].Message.AgentName)
+	assert.Equal(t, "Hello from test-agent-1", retrievedSession.Messages[1].Message.Message.Content)
+
+	// Third message should have the second agent's name
+	assert.Equal(t, "test-agent-2", retrievedSession.Messages[2].Message.AgentName)
+	assert.Equal(t, "Another message from test-agent-2", retrievedSession.Messages[2].Message.Message.Content)
+}
+
+func TestStoreMultipleAgents(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_store_multi.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	agent1 := agent.New("agent-1", "agent 1 prompt")
+	agent2 := agent.New("agent-2", "agent 2 prompt")
+
+	session := &Session{
+		ID:        "multi-agent-session",
+		CreatedAt: time.Now(),
+		Messages: []Item{
+			NewMessageItem(UserMessage("Start conversation")),
+			NewMessageItem(NewAgentMessage(agent1.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Response from agent 1",
+			})),
+			NewMessageItem(NewAgentMessage(agent2.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Response from agent 2",
+			})),
+		},
+	}
+
+	// Store the session
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve the session
+	retrievedSession, err := store.GetSession(t.Context(), "multi-agent-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrievedSession)
+
+	assert.Len(t, retrievedSession.Messages, 3)
+
+	// First message should be user message with empty agent name
+	assert.Empty(t, retrievedSession.Messages[0].Message.AgentName)
+
+	// Second message should have agent-1 name
+	assert.Equal(t, "agent-1", retrievedSession.Messages[1].Message.AgentName)
+	assert.Equal(t, "Response from agent 1", retrievedSession.Messages[1].Message.Message.Content)
+
+	// Third message should have agent-2 name
+	assert.Equal(t, "agent-2", retrievedSession.Messages[2].Message.AgentName)
+	assert.Equal(t, "Response from agent 2", retrievedSession.Messages[2].Message.Message.Content)
+}
+
+func TestGetSessions(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_get_sessions.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	testAgent := agent.New("test-agent", "test prompt")
+
+	session1 := &Session{
+		ID: "session-1",
+		Messages: []Item{
+			NewMessageItem(NewAgentMessage(testAgent.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Message from session 1",
+			})),
+		},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	}
+
+	session2 := &Session{
+		ID: "session-2",
+		Messages: []Item{
+			NewMessageItem(NewAgentMessage(testAgent.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Message from session 2",
+			})),
+		},
+		CreatedAt: time.Now(),
+	}
+
+	// Store the sessions
+	err = store.AddSession(t.Context(), session1)
+	require.NoError(t, err)
+	err = store.AddSession(t.Context(), session2)
+	require.NoError(t, err)
+
+	// Retrieve all sessions
+	sessions, err := store.GetSessions(t.Context())
+	require.NoError(t, err)
+	assert.Len(t, sessions, 2)
+
+	for _, session := range sessions {
+		assert.Len(t, session.Messages, 1)
+		assert.Equal(t, "test-agent", session.Messages[0].Message.AgentName)
+	}
+}
+
+func TestGetSessionSummaries(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_get_session_summaries.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	testAgent := agent.New("test-agent", "test prompt")
+
+	session1Time := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+	session2Time := time.Now().UTC().Truncate(time.Second)
+
+	session1 := &Session{
+		ID:    "session-1",
+		Title: "First Session",
+		Messages: []Item{
+			NewMessageItem(NewAgentMessage(testAgent.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "A very long message that should not be loaded when getting summaries",
+			})),
+		},
+		CreatedAt:  session1Time,
+		Cost:       0.25,
+		WorkingDir: "/work/project",
+	}
+
+	session2 := &Session{
+		ID:    "session-2",
+		Title: "Second Session",
+		Messages: []Item{
+			NewMessageItem(NewAgentMessage(testAgent.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Another long message that should not be loaded when getting summaries",
+			})),
+		},
+		CreatedAt: session2Time,
+		Cost:      0.50,
+	}
+
+	// Store the sessions
+	err = store.AddSession(t.Context(), session1)
+	require.NoError(t, err)
+	err = store.AddSession(t.Context(), session2)
+	require.NoError(t, err)
+
+	// Retrieve summaries (should be lightweight, without messages)
+	summaries, err := store.GetSessionSummaries(t.Context())
+	require.NoError(t, err)
+	assert.Len(t, summaries, 2)
+
+	// Summaries should be ordered by created_at DESC (most recent first)
+	assert.Equal(t, "session-2", summaries[0].ID)
+	assert.Equal(t, "Second Session", summaries[0].Title)
+	assert.Equal(t, session2Time, summaries[0].CreatedAt)
+	assert.Equal(t, 1, summaries[0].NumMessages)
+	assert.InDelta(t, 0.50, summaries[0].Cost, 1e-9)
+	assert.Empty(t, summaries[0].WorkingDir)
+
+	assert.Equal(t, "session-1", summaries[1].ID)
+	assert.Equal(t, "First Session", summaries[1].Title)
+	assert.Equal(t, session1Time, summaries[1].CreatedAt)
+	assert.Equal(t, 1, summaries[1].NumMessages)
+	assert.InDelta(t, 0.25, summaries[1].Cost, 1e-9)
+	assert.Equal(t, "/work/project", summaries[1].WorkingDir)
+}
+
+func TestGetSessionSummaries_CorruptCreatedAt(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_corrupt_created_at.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	sqlStore := store.(*SQLiteSessionStore)
+	defer sqlStore.Close()
+
+	validTime := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, store.AddSession(t.Context(), &Session{ID: "valid", CreatedAt: validTime}))
+
+	// Simulate a corrupt row written by an older/buggy version.
+	_, err = sqlStore.db.ExecContext(t.Context(),
+		"INSERT INTO sessions (id, created_at) VALUES (?, ?)", "corrupt", "139800")
+	require.NoError(t, err)
+
+	// Listing must not fail; the corrupt row gets a zero CreatedAt.
+	summaries, err := store.GetSessionSummaries(t.Context())
+	require.NoError(t, err)
+	require.Len(t, summaries, 2)
+	assert.Equal(t, "valid", summaries[0].ID)
+	assert.Equal(t, validTime, summaries[0].CreatedAt)
+	assert.Equal(t, "corrupt", summaries[1].ID)
+	assert.True(t, summaries[1].CreatedAt.IsZero())
+
+	// Loading the corrupt session directly must not fail either.
+	sess, err := store.GetSession(t.Context(), "corrupt")
+	require.NoError(t, err)
+	assert.True(t, sess.CreatedAt.IsZero())
+}
+
+func TestGetSessionSummaries_InMemory_WorkingDir(t *testing.T) {
+	t.Parallel()
+
+	store := NewInMemorySessionStore()
+
+	err := store.AddSession(t.Context(), &Session{
+		ID:         "session-1",
+		Title:      "First Session",
+		CreatedAt:  time.Now(),
+		Cost:       0.75,
+		WorkingDir: "/work/project",
+	})
+	require.NoError(t, err)
+
+	summaries, err := store.GetSessionSummaries(t.Context())
+	require.NoError(t, err)
+	require.Len(t, summaries, 1)
+	assert.InDelta(t, 0.75, summaries[0].Cost, 1e-9)
+	assert.Equal(t, "/work/project", summaries[0].WorkingDir)
+}
+
+func TestBranchSessionCopiesPrefix(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_branch_prefix.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	testAgent := agent.New("test-agent", "test prompt")
+	parent := &Session{
+		ID:        "parent-session",
+		CreatedAt: time.Now(),
+		Messages: []Item{
+			NewMessageItem(UserMessage("Hello")),
+			NewMessageItem(NewAgentMessage(testAgent.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Response",
+			})),
+			NewMessageItem(UserMessage("Edited")),
+		},
+	}
+
+	require.NoError(t, store.AddSession(t.Context(), parent))
+
+	parentLoaded, err := store.GetSession(t.Context(), parent.ID)
+	require.NoError(t, err)
+
+	branched, err := BranchSession(parentLoaded, 2)
+	require.NoError(t, err)
+
+	require.NoError(t, store.AddSession(t.Context(), branched))
+
+	loaded, err := store.GetSession(t.Context(), branched.ID)
+	require.NoError(t, err)
+
+	require.Len(t, loaded.Messages, 2)
+	assert.Equal(t, "Hello", loaded.Messages[0].Message.Message.Content)
+	assert.Equal(t, "Response", loaded.Messages[1].Message.Message.Content)
+}
+
+func TestBranchSessionClonesSubSession(t *testing.T) {
+	t.Parallel()
+
+	store := openMemoryStore(t)
+	_, err := store.db.ExecContext(t.Context(), "PRAGMA foreign_keys = ON")
+	require.NoError(t, err)
+
+	subSession := &Session{
+		ID:        "sub-session",
+		CreatedAt: time.Now(),
+		Messages: []Item{
+			NewMessageItem(UserMessage("Sub message")),
+		},
+	}
+	parent := &Session{
+		ID:        "parent-session",
+		CreatedAt: time.Now(),
+		Messages: []Item{
+			NewMessageItem(UserMessage("Start")),
+			NewSubSessionItem(subSession),
+			NewMessageItem(UserMessage("After")),
+		},
+	}
+
+	require.NoError(t, store.AddSession(t.Context(), parent))
+
+	parentLoaded, err := store.GetSession(t.Context(), parent.ID)
+	require.NoError(t, err)
+
+	branched, err := BranchSession(parentLoaded, 2)
+	require.NoError(t, err)
+
+	require.NoError(t, store.AddSession(t.Context(), branched))
+
+	loaded, err := store.GetSession(t.Context(), branched.ID)
+	require.NoError(t, err)
+	require.Len(t, loaded.Messages, 2)
+
+	subItem := loaded.Messages[1]
+	require.NotNil(t, subItem.SubSession)
+	assert.NotEqual(t, subSession.ID, subItem.SubSession.ID)
+	assert.Equal(t, loaded.ID, subItem.SubSession.ParentID)
+	require.Len(t, subItem.SubSession.Messages, 1)
+	assert.Equal(t, "Sub message", subItem.SubSession.Messages[0].Message.Message.Content)
+}
+
+func TestStoreAgentNameJSON(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_store_json.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	agent1 := agent.New("my-agent", "test prompt")
+	agent2 := agent.New("another-agent", "another prompt")
+
+	session := &Session{
+		ID: "json-test-session",
+		Messages: []Item{
+			NewMessageItem(UserMessage("User input")),
+			NewMessageItem(NewAgentMessage(agent1.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Response from my-agent",
+			})),
+			NewMessageItem(NewAgentMessage(agent2.Name(), &chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Response from another-agent",
+			})),
+		},
+		CreatedAt: time.Now(),
+	}
+
+	// Store the session
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve the session
+	retrievedSession, err := store.GetSession(t.Context(), "json-test-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrievedSession)
+
+	assert.Empty(t, retrievedSession.Messages[0].Message.AgentName)                  // User message
+	assert.Equal(t, "my-agent", retrievedSession.Messages[1].Message.AgentName)      // First agent
+	assert.Equal(t, "another-agent", retrievedSession.Messages[2].Message.AgentName) // Second agent
+}
+
+func TestUpdateSession_LazyCreation(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_lazy.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	testAgent := agent.New("test-agent", "test prompt")
+
+	// Create a session but don't add it to the store (simulating lazy creation)
+	session := &Session{
+		ID:        "lazy-session",
+		CreatedAt: time.Now(),
+	}
+
+	// Verify session doesn't exist yet
+	_, err = store.GetSession(t.Context(), "lazy-session")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	// UpdateSession creates the session (upsert) but does NOT persist messages
+	// Messages must be added separately via AddMessage
+	err = store.UpdateSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Session exists but has no messages yet
+	retrieved, err := store.GetSession(t.Context(), "lazy-session")
+	require.NoError(t, err)
+	assert.Empty(t, retrieved.Messages)
+
+	// Add messages via AddMessage (the proper way)
+	_, err = store.AddMessage(t.Context(), "lazy-session", UserMessage("Hello"))
+	require.NoError(t, err)
+
+	_, err = store.AddMessage(t.Context(), "lazy-session", NewAgentMessage(testAgent.Name(), &chat.Message{
+		Role:    chat.MessageRoleAssistant,
+		Content: "Hi there!",
+	}))
+	require.NoError(t, err)
+
+	// Now the session should have messages
+	retrieved, err = store.GetSession(t.Context(), "lazy-session")
+	require.NoError(t, err)
+	assert.Len(t, retrieved.Messages, 2)
+	assert.Equal(t, "Hello", retrieved.Messages[0].Message.Message.Content)
+	assert.Equal(t, "Hi there!", retrieved.Messages[1].Message.Message.Content)
+}
+
+func TestUpdateSession_LazyCreation_InMemory(t *testing.T) {
+	t.Parallel()
+
+	store := NewInMemorySessionStore()
+
+	testAgent := agent.New("test-agent", "test prompt")
+
+	// Create a session but don't add it to the store
+	session := &Session{
+		ID:        "lazy-session",
+		CreatedAt: time.Now(),
+	}
+
+	// Verify session doesn't exist yet
+	_, err := store.GetSession(t.Context(), "lazy-session")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	// UpdateSession creates the session (upsert) without messages
+	// Messages must be added separately via AddMessage (like SQLite behavior)
+	err = store.UpdateSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Session exists but has no messages yet
+	retrieved, err := store.GetSession(t.Context(), "lazy-session")
+	require.NoError(t, err)
+	assert.Empty(t, retrieved.Messages)
+
+	// Add messages via AddMessage
+	_, err = store.AddMessage(t.Context(), "lazy-session", UserMessage("Hello"))
+	require.NoError(t, err)
+	_, err = store.AddMessage(t.Context(), "lazy-session", NewAgentMessage(testAgent.Name(), &chat.Message{
+		Role:    chat.MessageRoleAssistant,
+		Content: "Hi there!",
+	}))
+	require.NoError(t, err)
+
+	// Now the session has 2 messages
+	retrieved, err = store.GetSession(t.Context(), "lazy-session")
+	require.NoError(t, err)
+	assert.Len(t, retrieved.Messages, 2)
+}
+
+func TestStorePermissions(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_permissions.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Create a session with permissions
+	session := &Session{
+		ID:        "permissions-session",
+		CreatedAt: time.Now(),
+		Permissions: &PermissionsConfig{
+			Allow: []string{"read_*", "think"},
+			Deny:  []string{"shell:cmd=rm*", "dangerous_tool"},
+		},
+	}
+
+	// Store the session
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve the session
+	retrieved, err := store.GetSession(t.Context(), "permissions-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved.Permissions)
+
+	assert.Equal(t, []string{"read_*", "think"}, retrieved.Permissions.Allow)
+	assert.Equal(t, []string{"shell:cmd=rm*", "dangerous_tool"}, retrieved.Permissions.Deny)
+}
+
+func TestStorePermissions_NilPermissions(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_nil_permissions.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Create a session without permissions (legacy behavior)
+	session := &Session{
+		ID:        "no-permissions-session",
+		CreatedAt: time.Now(),
+	}
+
+	// Store the session
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve the session
+	retrieved, err := store.GetSession(t.Context(), "no-permissions-session")
+	require.NoError(t, err)
+
+	// Permissions should be nil
+	assert.Nil(t, retrieved.Permissions)
+}
+
+func TestUpdateSession_Permissions(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_update_permissions.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Create a session without permissions
+	session := &Session{
+		ID:        "update-permissions-session",
+		CreatedAt: time.Now(),
+	}
+
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Update with permissions
+	session.Permissions = &PermissionsConfig{
+		Allow: []string{"safe_*"},
+		Deny:  []string{"dangerous_*"},
+	}
+
+	err = store.UpdateSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve and verify
+	retrieved, err := store.GetSession(t.Context(), "update-permissions-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved.Permissions)
+
+	assert.Equal(t, []string{"safe_*"}, retrieved.Permissions.Allow)
+	assert.Equal(t, []string{"dangerous_*"}, retrieved.Permissions.Deny)
+}
+
+func TestAgentModelOverrides_SQLite(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_model_overrides.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Create a session with model overrides
+	session := &Session{
+		ID:        "model-override-session",
+		Title:     "Test Session",
+		CreatedAt: time.Now(),
+		AgentModelOverrides: map[string]string{
+			"root":       "openai/gpt-4o",
+			"researcher": "anthropic/claude-sonnet-4-0",
+		},
+	}
+
+	// Store the session
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve the session
+	retrieved, err := store.GetSession(t.Context(), "model-override-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+
+	// Verify model overrides were persisted
+	assert.Len(t, retrieved.AgentModelOverrides, 2)
+	assert.Equal(t, "openai/gpt-4o", retrieved.AgentModelOverrides["root"])
+	assert.Equal(t, "anthropic/claude-sonnet-4-0", retrieved.AgentModelOverrides["researcher"])
+}
+
+func TestAgentModelOverrides_Update(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_model_overrides_update.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Create a session without model overrides
+	session := &Session{
+		ID:        "update-model-override-session",
+		Title:     "Test Session",
+		CreatedAt: time.Now(),
+	}
+
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Update the session with model overrides
+	session.AgentModelOverrides = map[string]string{
+		"root": "google/gemini-2.5-flash",
+	}
+
+	err = store.UpdateSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve and verify
+	retrieved, err := store.GetSession(t.Context(), "update-model-override-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+
+	assert.Len(t, retrieved.AgentModelOverrides, 1)
+	assert.Equal(t, "google/gemini-2.5-flash", retrieved.AgentModelOverrides["root"])
+}
+
+func TestAgentModelOverrides_EmptyMap(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_model_overrides_empty.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Create a session without model overrides (nil map)
+	session := &Session{
+		ID:        "no-override-session",
+		Title:     "Test Session",
+		CreatedAt: time.Now(),
+	}
+
+	err = store.AddSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Retrieve the session
+	retrieved, err := store.GetSession(t.Context(), "no-override-session")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+
+	// Verify no model overrides (should be nil or empty)
+	assert.Empty(t, retrieved.AgentModelOverrides)
+}
+
+// TestOrphanedSubsessionReference verifies that loading sessions gracefully
+// handles orphaned subsession references (where the subsession was deleted
+// but the reference in session_items remains).
+func TestOrphanedSubsessionReference(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_orphaned.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	sqliteStore := store.(*SQLiteSessionStore)
+
+	// Create parent session
+	parentSession := &Session{
+		ID:        "parent-session",
+		CreatedAt: time.Now(),
+	}
+	err = store.AddSession(t.Context(), parentSession)
+	require.NoError(t, err)
+
+	// Add a message to parent
+	_, err = store.AddMessage(t.Context(), "parent-session", UserMessage("Start task"))
+	require.NoError(t, err)
+
+	// Create and add a sub-session
+	subSession := &Session{
+		ID:        "sub-session-to-delete",
+		CreatedAt: time.Now(),
+		Messages: []Item{
+			NewMessageItem(UserMessage("Sub task")),
+		},
+	}
+	err = store.AddSubSession(t.Context(), "parent-session", subSession)
+	require.NoError(t, err)
+
+	// Verify session loads correctly before deletion
+	retrieved, err := store.GetSession(t.Context(), "parent-session")
+	require.NoError(t, err)
+	assert.Len(t, retrieved.Messages, 2) // user message + subsession
+
+	// Now delete the sub-session directly from the database
+	// This simulates a scenario where the sub-session is deleted but the
+	// reference in session_items remains (the FK sets it to NULL)
+	_, err = sqliteStore.db.ExecContext(t.Context(), "DELETE FROM sessions WHERE id = ?", "sub-session-to-delete")
+	require.NoError(t, err)
+
+	// Loading the parent session should gracefully skip the orphaned reference
+	retrieved, err = store.GetSession(t.Context(), "parent-session")
+	require.NoError(t, err)
+	assert.Len(t, retrieved.Messages, 1) // Only the user message remains
+	assert.Equal(t, "Start task", retrieved.Messages[0].Message.Message.Content)
+
+	// GetSessions should also work without error
+	sessions, err := store.GetSessions(t.Context())
+	require.NoError(t, err)
+	assert.Len(t, sessions, 1)
+	assert.Equal(t, "parent-session", sessions[0].ID)
+}
+
+// TestMigration_ExistingMessagesToSessionItems verifies that the migration
+// properly converts legacy messages JSON to session_items table.
+func TestMigration_ExistingMessagesToSessionItems(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_migration.db")
+
+	// First, create a database with the legacy schema (before migrations)
+	db, err := sql.Open("sqlite", tempDB)
+	require.NoError(t, err)
+
+	// Create minimal schema
+	_, err = db.ExecContext(t.Context(), `
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			messages TEXT,
+			created_at TEXT
+		)
+	`)
+	require.NoError(t, err)
+
+	// Insert a legacy session with messages
+	legacyMessages := []Item{
+		NewMessageItem(UserMessage("Legacy message 1")),
+		NewMessageItem(&Message{
+			AgentName: "legacy-agent",
+			Message: chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "Legacy response",
+			},
+		}),
+	}
+	legacyJSON, err := json.Marshal(legacyMessages)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(t.Context(),
+		"INSERT INTO sessions (id, messages, created_at) VALUES (?, ?, ?)",
+		"migration-test-session", string(legacyJSON), time.Now().Format(time.RFC3339))
+	require.NoError(t, err)
+
+	db.Close()
+
+	// Now open with the store, which runs migrations
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Session should be readable via the new API
+	retrieved, err := store.GetSession(t.Context(), "migration-test-session")
+	require.NoError(t, err)
+
+	assert.Len(t, retrieved.Messages, 2)
+	assert.Equal(t, "Legacy message 1", retrieved.Messages[0].Message.Message.Content)
+	assert.Equal(t, "legacy-agent", retrieved.Messages[1].Message.AgentName)
+}
+
+func TestAddError_SQLiteRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_add_error.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	session := &Session{ID: "error-session", CreatedAt: time.Now()}
+	require.NoError(t, store.AddSession(t.Context(), session))
+
+	_, err = store.AddMessage(t.Context(), "error-session", UserMessage("do something"))
+	require.NoError(t, err)
+
+	err = store.AddError(t.Context(), "error-session", &Error{
+		Message:   "model stream failed",
+		Code:      "model_error",
+		AgentName: "root",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	require.NoError(t, err)
+
+	retrieved, err := store.GetSession(t.Context(), "error-session")
+	require.NoError(t, err)
+	require.Len(t, retrieved.Messages, 2)
+
+	errItem := retrieved.Messages[1]
+	require.True(t, errItem.IsError())
+	assert.Equal(t, "model stream failed", errItem.Error.Message)
+	assert.Equal(t, "model_error", errItem.Error.Code)
+	assert.Equal(t, "root", errItem.Error.AgentName)
+
+	// Errors are not conversation messages, so GetAllMessages skips them.
+	assert.Len(t, retrieved.GetAllMessages(), 1)
+}
+
+func TestAddError_InMemoryRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	store := NewInMemorySessionStore()
+
+	session := &Session{ID: "error-session", CreatedAt: time.Now()}
+	require.NoError(t, store.AddSession(t.Context(), session))
+
+	err := store.AddError(t.Context(), "error-session", &Error{Message: "boom", Code: "tool_failed"})
+	require.NoError(t, err)
+
+	retrieved, err := store.GetSession(t.Context(), "error-session")
+	require.NoError(t, err)
+	require.Len(t, retrieved.Messages, 1)
+	require.True(t, retrieved.Messages[0].IsError())
+	assert.Equal(t, "boom", retrieved.Messages[0].Error.Message)
+	assert.Equal(t, "tool_failed", retrieved.Messages[0].Error.Code)
+}
+
+func TestAddError_NotFound(t *testing.T) {
+	t.Parallel()
+
+	store := NewInMemorySessionStore()
+	err := store.AddError(t.Context(), "missing", &Error{Message: "boom"})
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestAddSubSession_InMemoryChildIsEmbedded pins sub-session cost provenance
+// in the in-memory store: AddSubSession records store history, not a live
+// runtime attachment, so a parent fetched via GetSession must report the
+// child's cost through EmbeddedSubSessionCost — the component live usage
+// reporting folds into the parent's own cost. A live-attached child would be
+// skipped there, leaving the fetched parent's usage ($0.10) short of its
+// TotalCost ($0.15).
+func TestAddSubSession_InMemoryChildIsEmbedded(t *testing.T) {
+	t.Parallel()
+
+	store := NewInMemorySessionStore()
+
+	root := New(WithID("cost-root"))
+	root.AddMessage(&Message{Message: chat.Message{Role: chat.MessageRoleAssistant, Content: "done", Cost: 0.10}})
+	require.NoError(t, store.AddSession(t.Context(), root))
+
+	child := New()
+	child.AddMessage(&Message{Message: chat.Message{Role: chat.MessageRoleAssistant, Content: "done", Cost: 0.05}})
+	require.NoError(t, store.AddSubSession(t.Context(), root.ID, child))
+
+	got, err := store.GetSession(t.Context(), root.ID)
+	require.NoError(t, err)
+	assert.InDelta(t, 0.05, got.EmbeddedSubSessionCost(), 1e-9,
+		"a store-attached child is embedded history, not a live attachment")
+	assert.InDelta(t, 0.15, got.TotalCost(), 1e-9)
+	assert.InDelta(t, got.TotalCost(), got.OwnCost()+got.EmbeddedSubSessionCost(), 1e-9,
+		"own + embedded — what live usage reporting emits — must equal the total")
+}
+
+// TestSQLiteStore_CostsSurviveReload proves the full cost surface of a
+// session round-trips through the on-disk schema: a normal message cost, a
+// compaction summary cost written through the real AddSummary route, and an
+// embedded sub-session's costs (persisted via addItemTx, including its own
+// summary item). TotalCost must be identical before and after closing and
+// reopening the store.
+func TestSQLiteStore_CostsSurviveReload(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_cost_roundtrip.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+
+	root := New(WithID("cost-roundtrip-root"))
+	root.AddMessage(&Message{Message: chat.Message{Role: chat.MessageRoleAssistant, Content: "done", Cost: 0.10}})
+
+	child := New(WithParentID(root.ID))
+	child.AddMessage(&Message{Message: chat.Message{Role: chat.MessageRoleAssistant, Content: "child done", Cost: 0.05}})
+	child.Messages = append(child.Messages, Item{Summary: "child summary", Cost: 0.02})
+	root.AddSubSession(child)
+
+	require.NoError(t, store.AddSession(t.Context(), root))
+	rootSummary := Item{Summary: "root summary", FirstKeptEntry: 1, Cost: 0.01, Model: "openai/gpt-4o-mini", Usage: &chat.Usage{InputTokens: 100, OutputTokens: 20}}
+	require.NoError(t, store.AddSummary(t.Context(), root.ID, rootSummary))
+	// Mirror AddSummary in memory so the pre-reload total includes it.
+	root.Messages = append(root.Messages, rootSummary)
+
+	want := root.TotalCost()
+	require.InDelta(t, 0.18, want, 1e-9)
+	require.NoError(t, store.(*SQLiteSessionStore).Close())
+
+	reopened, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer reopened.(*SQLiteSessionStore).Close()
+
+	got, err := reopened.GetSession(t.Context(), root.ID)
+	require.NoError(t, err)
+
+	last := got.Messages[len(got.Messages)-1]
+	require.Equal(t, "root summary", last.Summary)
+	assert.Equal(t, 1, last.FirstKeptEntry)
+	assert.InDelta(t, 0.01, last.Cost, 1e-9, "the summary item's cost must survive persistence")
+	assert.Equal(t, "openai/gpt-4o-mini", last.Model, "the summary item's model must survive persistence")
+	require.NotNil(t, last.Usage, "the summary item's usage must survive persistence")
+	assert.Equal(t, int64(100), last.Usage.InputTokens)
+	assert.Equal(t, int64(20), last.Usage.OutputTokens)
+	assert.InDelta(t, want, got.TotalCost(), 1e-9,
+		"TotalCost must be identical after closing and reopening the store")
+}
+
+func TestIsRelativeSessionRef(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, IsRelativeSessionRef("-1"))
+	assert.True(t, IsRelativeSessionRef("-10"))
+	assert.False(t, IsRelativeSessionRef("550e8400-e29b-41d4-a716-446655440000"))
+	assert.False(t, IsRelativeSessionRef(""))
+	assert.False(t, IsRelativeSessionRef("abc123"))
+}
+
+func TestParseRelativeSessionRef(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		ref        string
+		wantOffset int
+		wantIsRel  bool
+	}{
+		{"last session", "-1", 1, true},
+		{"second to last", "-2", 2, true},
+		{"tenth session", "-10", 10, true},
+		{"regular ID", "abc123", 0, false},
+		{"UUID-like", "550e8400-e29b-41d4-a716-446655440000", 0, false},
+		{"positive number", "1", 0, false},
+		{"zero", "0", 0, false},
+		{"negative zero", "-0", 0, false},
+		{"not a number", "-abc", 0, false},
+		{"empty string", "", 0, false},
+		{"just dash", "-", 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			offset, isRel := parseRelativeSessionRef(tt.ref)
+			assert.Equal(t, tt.wantOffset, offset)
+			assert.Equal(t, tt.wantIsRel, isRel)
+		})
+	}
+}
+
+func TestResolveSessionID_SQLite(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_resolve.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	// Create sessions with known timestamps
+	baseTime := time.Now()
+	sessions := []struct {
+		id        string
+		createdAt time.Time
+	}{
+		{"oldest", baseTime.Add(-3 * time.Hour)},
+		{"middle", baseTime.Add(-2 * time.Hour)},
+		{"newest", baseTime.Add(-1 * time.Hour)},
+	}
+
+	for _, s := range sessions {
+		err := store.AddSession(t.Context(), &Session{
+			ID:        s.id,
+			CreatedAt: s.createdAt,
+		})
+		require.NoError(t, err)
+	}
+
+	t.Run("resolves -1 to newest session", func(t *testing.T) {
+		id, err := ResolveSessionID(t.Context(), store, "-1")
+		require.NoError(t, err)
+		assert.Equal(t, "newest", id)
+	})
+
+	t.Run("resolves -2 to middle session", func(t *testing.T) {
+		id, err := ResolveSessionID(t.Context(), store, "-2")
+		require.NoError(t, err)
+		assert.Equal(t, "middle", id)
+	})
+
+	t.Run("resolves -3 to oldest session", func(t *testing.T) {
+		id, err := ResolveSessionID(t.Context(), store, "-3")
+		require.NoError(t, err)
+		assert.Equal(t, "oldest", id)
+	})
+
+	t.Run("returns error for out of range offset", func(t *testing.T) {
+		_, err := ResolveSessionID(t.Context(), store, "-4")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "out of range")
+	})
+
+	t.Run("returns non-relative ID unchanged", func(t *testing.T) {
+		id, err := ResolveSessionID(t.Context(), store, "some-uuid")
+		require.NoError(t, err)
+		assert.Equal(t, "some-uuid", id)
+	})
+}
+
+func TestResolveSessionID_ExcludesSubSessions(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_resolve_subsessions.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	sqliteStore := store.(*SQLiteSessionStore)
+
+	// Create a parent session
+	parent := &Session{
+		ID:        "parent",
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+	}
+	err = store.AddSession(t.Context(), parent)
+	require.NoError(t, err)
+
+	// Create a sub-session directly in the database to avoid the AddSubSession complexity
+	// This simulates an existing sub-session without going through the full API
+	subSessionTime := time.Now().Add(-1 * time.Hour)
+	_, err = sqliteStore.db.ExecContext(t.Context(),
+		`INSERT INTO sessions (id, tools_approved, input_tokens, output_tokens, title, cost, send_user_message, max_iterations, working_dir, created_at, starred, permissions, agent_model_overrides, custom_models_used, thinking, parent_id)
+		 VALUES (?, 0, 0, 0, '', 0, 1, 0, '', ?, 0, '', '{}', '[]', 1, ?)`,
+		"subsession", subSessionTime.Format(time.RFC3339), "parent")
+	require.NoError(t, err)
+
+	// Create another root session (most recent root)
+	root2 := &Session{
+		ID:        "root2",
+		CreatedAt: time.Now(),
+	}
+	err = store.AddSession(t.Context(), root2)
+	require.NoError(t, err)
+
+	// -1 should resolve to root2, not the subsession
+	id, err := ResolveSessionID(t.Context(), store, "-1")
+	require.NoError(t, err)
+	assert.Equal(t, "root2", id)
+
+	// -2 should resolve to parent
+	id, err = ResolveSessionID(t.Context(), store, "-2")
+	require.NoError(t, err)
+	assert.Equal(t, "parent", id)
+}
+
+func TestResolveSessionID_InMemory(t *testing.T) {
+	t.Parallel()
+
+	store := NewInMemorySessionStore()
+
+	// Create sessions with known timestamps
+	baseTime := time.Now()
+	sessions := []struct {
+		id        string
+		createdAt time.Time
+	}{
+		{"oldest", baseTime.Add(-3 * time.Hour)},
+		{"middle", baseTime.Add(-2 * time.Hour)},
+		{"newest", baseTime.Add(-1 * time.Hour)},
+	}
+
+	for _, s := range sessions {
+		err := store.AddSession(t.Context(), &Session{
+			ID:        s.id,
+			CreatedAt: s.createdAt,
+		})
+		require.NoError(t, err)
+	}
+
+	t.Run("resolves -1 to newest session", func(t *testing.T) {
+		id, err := ResolveSessionID(t.Context(), store, "-1")
+		require.NoError(t, err)
+		assert.Equal(t, "newest", id)
+	})
+
+	t.Run("resolves -2 to middle session", func(t *testing.T) {
+		id, err := ResolveSessionID(t.Context(), store, "-2")
+		require.NoError(t, err)
+		assert.Equal(t, "middle", id)
+	})
+
+	t.Run("returns error for out of range offset", func(t *testing.T) {
+		_, err := ResolveSessionID(t.Context(), store, "-4")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "out of range")
+	})
+
+	t.Run("returns non-relative ID unchanged", func(t *testing.T) {
+		id, err := ResolveSessionID(t.Context(), store, "some-uuid")
+		require.NoError(t, err)
+		assert.Equal(t, "some-uuid", id)
+	})
+}
+
+// TestAddSessionTerminationRoundTrip verifies that a termination marker
+// item written by AddSession survives a SQLite reload at its chronological
+// position, alongside the assistant stop message that follows it.
+func TestAddSessionTerminationRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tempDB := filepath.Join(t.TempDir(), "test_termination.db")
+
+	store, err := newSQLiteStoreForTest(t, tempDB)
+	require.NoError(t, err)
+	defer store.(*SQLiteSessionStore).Close()
+
+	term := &Termination{
+		Reason:     TerminationReasonBudgetExceeded,
+		Budget:     "run",
+		Limit:      "max_cost",
+		Used:       "$0.03",
+		Max:        "$0.03",
+		ConfigPath: "budget.max_cost",
+		Message:    "Execution stopped after reaching the configured budget.max_cost limit (used $0.03 of $0.03).",
+	}
+	sess := &Session{
+		ID:        "budget-session",
+		CreatedAt: time.Now(),
+		Messages: []Item{
+			{Message: UserMessage("do work")},
+			NewTerminationItem(term),
+			{Message: &Message{
+				AgentName: "root",
+				Message: chat.Message{
+					Role:      chat.MessageRoleAssistant,
+					Content:   term.Message,
+					CreatedAt: time.Now().UTC().Format(time.RFC3339),
+				},
+			}},
+		},
+	}
+	require.NoError(t, store.AddSession(t.Context(), sess))
+
+	retrieved, err := store.GetSession(t.Context(), "budget-session")
+	require.NoError(t, err)
+	require.Len(t, retrieved.Messages, 3)
+
+	require.True(t, retrieved.Messages[1].IsTermination())
+	assert.Equal(t, *term, *retrieved.Messages[1].Termination)
+	assert.Equal(t, *term, *retrieved.Termination())
+
+	stop := retrieved.Messages[2].Message
+	require.NotNil(t, stop)
+	assert.Equal(t, chat.MessageRoleAssistant, stop.Message.Role)
+	assert.Equal(t, term.Message, stop.Message.Content)
+	assert.Equal(t, "root", stop.AgentName)
+
+	// Termination markers are not conversation messages.
+	assert.Len(t, retrieved.GetAllMessages(), 2)
+}
+
+func TestAddSession_PreservesStarred(t *testing.T) {
+	store, err := newSQLiteStoreForTest(t, filepath.Join(t.TempDir(), "sessions.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	sess := New(WithID("starred-session"))
+	sess.Starred = true
+	require.NoError(t, store.AddSession(t.Context(), sess))
+
+	loaded, err := store.GetSession(t.Context(), "starred-session")
+	require.NoError(t, err)
+	assert.True(t, loaded.Starred)
+}

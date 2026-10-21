@@ -1,0 +1,1126 @@
+package session
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"uuid"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tools/builtin/todo"
+)
+
+func todoToolSet(t *testing.T) tools.ToolSet {
+	t.Helper()
+	toolSet, err := todo.CreateToolSet(latest.Toolset{})
+	require.NoError(t, err)
+	return toolSet
+}
+
+func TestNew_GeneratesV4UUID(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	id, err := uuid.Parse(s.ID)
+	require.NoError(t, err)
+	assert.Equal(t, id.String(), s.ID)
+	assert.Equal(t, byte(4), id[6]>>4)
+	assert.Equal(t, byte(0x80), id[8]&0xc0)
+}
+
+func TestTrimMessagesWithToolCalls(t *testing.T) {
+	t.Parallel()
+
+	messages := []chat.Message{
+		{
+			Role:    chat.MessageRoleUser,
+			Content: "first message",
+		},
+		{
+			Role:    chat.MessageRoleAssistant,
+			Content: "response with tool",
+			ToolCalls: []tools.ToolCall{
+				{
+					ID: "tool1",
+				},
+			},
+		},
+		{
+			Role:       chat.MessageRoleTool,
+			Content:    "tool result",
+			ToolCallID: "tool1",
+		},
+		{
+			Role:    chat.MessageRoleUser,
+			Content: "second message",
+		},
+		{
+			Role:    chat.MessageRoleAssistant,
+			Content: "another response",
+			ToolCalls: []tools.ToolCall{
+				{
+					ID: "tool2",
+				},
+			},
+		},
+		{
+			Role:       chat.MessageRoleTool,
+			Content:    "tool result 2",
+			ToolCallID: "tool2",
+		},
+	}
+
+	// Use 3 as the limit to force trimming
+	maxItems := 3
+
+	result := trimMessages(messages, maxItems)
+
+	// Both user messages are protected, so result includes them plus the most recent assistant/tool pair
+	toolCalls := make(map[string]bool)
+	for _, msg := range result {
+		if msg.Role == chat.MessageRoleAssistant {
+			for _, tool := range msg.ToolCalls {
+				toolCalls[tool.ID] = true
+			}
+		}
+		if msg.Role == chat.MessageRoleTool {
+			assert.True(t, toolCalls[msg.ToolCallID], "tool result should have corresponding assistant message")
+		}
+	}
+}
+
+func TestGetMessagesWithToolCalls(t *testing.T) {
+	t.Parallel()
+
+	testAgent := &agent.Agent{}
+
+	s := New()
+
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:    chat.MessageRoleUser,
+		Content: "test message",
+	}))
+
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:    chat.MessageRoleAssistant,
+		Content: "using tool",
+		ToolCalls: []tools.ToolCall{
+			{
+				ID: "test-tool",
+			},
+		},
+	}))
+
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:       chat.MessageRoleTool,
+		ToolCallID: "test-tool",
+		Content:    "tool result",
+	}))
+
+	messages := s.GetMessages(testAgent)
+
+	toolCalls := make(map[string]bool)
+	for _, msg := range messages {
+		if msg.Role == chat.MessageRoleAssistant {
+			for _, tool := range msg.ToolCalls {
+				toolCalls[tool.ID] = true
+			}
+		}
+		if msg.Role == chat.MessageRoleTool {
+			assert.True(t, toolCalls[msg.ToolCallID], "tool result should have corresponding assistant message")
+		}
+	}
+}
+
+func TestGetMessagesWithSummary(t *testing.T) {
+	t.Parallel()
+
+	testAgent := &agent.Agent{}
+
+	s := New()
+
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:    chat.MessageRoleUser,
+		Content: "first message",
+	}))
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:    chat.MessageRoleAssistant,
+		Content: "first response",
+	}))
+
+	s.Messages = append(s.Messages, Item{Summary: "This is a summary of the conversation so far"})
+
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:    chat.MessageRoleUser,
+		Content: "message after summary",
+	}))
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:    chat.MessageRoleAssistant,
+		Content: "response after summary",
+	}))
+
+	messages := s.GetMessages(testAgent)
+
+	// Count non-system messages (user and assistant only)
+	userAssistantMessages := 0
+	summaryFound := false
+	for _, msg := range messages {
+		if msg.Role == chat.MessageRoleUser || msg.Role == chat.MessageRoleAssistant {
+			userAssistantMessages++
+		}
+		if msg.Role == chat.MessageRoleUser && msg.Content == "Session Summary: This is a summary of the conversation so far" {
+			summaryFound = true
+		}
+	}
+
+	// We should have:
+	// - 1 summary user message
+	// - 2 messages after the summary (user + assistant)
+	// - Various other system messages from agent setup
+	assert.True(t, summaryFound, "should include summary as user message")
+	assert.Equal(t, 3, userAssistantMessages, "should only include messages after summary")
+}
+
+func TestLastSummary(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	assert.Empty(t, s.LastSummary(), "fresh session has no summary")
+
+	s.AddMessage(NewAgentMessage("", &chat.Message{Role: chat.MessageRoleUser, Content: "hi"}))
+	s.Messages = append(s.Messages, Item{Summary: "first summary"})
+	s.AddMessage(NewAgentMessage("", &chat.Message{Role: chat.MessageRoleUser, Content: "more"}))
+	s.Messages = append(s.Messages, Item{Summary: "second summary"})
+
+	assert.Equal(t, "second summary", s.LastSummary(), "most recent summary wins")
+}
+
+// TestSummaryMessageContentMatchesGetMessages pins the contract consumers
+// (e.g. the runtime context breakdown) rely on: the synthetic summary
+// message in GetMessages output equals SummaryMessageContent(LastSummary()).
+func TestSummaryMessageContentMatchesGetMessages(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	s.Messages = append(s.Messages, Item{Summary: "what happened before"})
+
+	messages := s.GetMessages(&agent.Agent{})
+	require.NotEmpty(t, messages)
+
+	want := SummaryMessageContent(s.LastSummary())
+	found := false
+	for _, msg := range messages {
+		if msg.Role == chat.MessageRoleUser && msg.Content == want {
+			found = true
+		}
+	}
+	assert.True(t, found, "GetMessages output must contain the exact SummaryMessageContent string")
+}
+
+// TestGetMessagesAndLastSummary pins the accessor's contract: messages and
+// summary come from the same history snapshot, the summary is exactly the
+// text behind the synthetic "Session Summary: ..." user message, and the
+// most recent summary item wins.
+func TestGetMessagesAndLastSummary(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	messages, summary := s.GetMessagesAndLastSummary(&agent.Agent{})
+	assert.Empty(t, messages)
+	assert.Empty(t, summary, "fresh session has no summary")
+
+	s.AddMessage(NewAgentMessage("", &chat.Message{Role: chat.MessageRoleUser, Content: "hi"}))
+	s.Messages = append(s.Messages, Item{Summary: "first summary"})
+	s.AddMessage(NewAgentMessage("", &chat.Message{Role: chat.MessageRoleUser, Content: "more"}))
+	s.Messages = append(s.Messages, Item{Summary: "second summary"})
+
+	messages, summary = s.GetMessagesAndLastSummary(&agent.Agent{})
+	assert.Equal(t, "second summary", summary, "most recent summary wins")
+
+	want := SummaryMessageContent(summary)
+	found := false
+	for _, msg := range messages {
+		if msg.Role == chat.MessageRoleUser && msg.Content == want {
+			found = true
+		}
+	}
+	assert.True(t, found, "returned summary must be exactly the synthetic summary message's text")
+}
+
+func TestGetMessages_Instructions(t *testing.T) {
+	t.Parallel()
+
+	testAgent := agent.New("root", "instructions")
+
+	s := New()
+	messages := s.GetMessages(testAgent)
+
+	assert.Len(t, messages, 1)
+	assert.Equal(t, "instructions", messages[0].Content)
+	assert.True(t, messages[0].CacheControl)
+}
+
+func TestAddMessage_StripsCacheControl(t *testing.T) {
+	t.Parallel()
+
+	// CacheControl and TurnScoped are request-assembly state; transcripts
+	// must never carry them (e.g. marks echoed back by an API client), or
+	// they would resurface on every future prompt assembly.
+	s := New()
+	s.AddMessage(&Message{Message: chat.Message{
+		Role:         chat.MessageRoleUser,
+		Content:      "hello",
+		CacheControl: true,
+		TurnScoped:   true,
+	}})
+
+	assert.False(t, s.Messages[0].Message.Message.CacheControl)
+	assert.False(t, s.Messages[0].Message.Message.TurnScoped)
+}
+
+func TestGetMessages_ExtrasAreTurnScoped(t *testing.T) {
+	t.Parallel()
+
+	testAgent := agent.New("root", "instructions")
+	s := New()
+	s.AddMessage(UserMessage("hi"))
+	extras := []chat.Message{
+		{Role: chat.MessageRoleSystem, Content: "env"},
+		{Role: chat.MessageRoleSystem, Content: "date"},
+	}
+
+	messages := s.GetMessages(testAgent, extras...)
+
+	var scoped []string
+	for _, msg := range messages {
+		if msg.TurnScoped {
+			scoped = append(scoped, msg.Content)
+		}
+	}
+	assert.Equal(t, []string{"env", "date"}, scoped, "only the extras are turn-scoped")
+	assert.False(t, messages[0].TurnScoped, "agent instructions stay stable")
+	for _, extra := range extras {
+		assert.False(t, extra.TurnScoped, "the caller's messages are not mutated")
+	}
+}
+
+func TestGetMessages_CacheControl(t *testing.T) {
+	t.Parallel()
+
+	testAgent := agent.New("root", "instructions", agent.WithToolSets(todoToolSet(t)))
+
+	s := New()
+	messages := s.GetMessages(testAgent)
+
+	assert.Len(t, messages, 2)
+	assert.Equal(t, "instructions", messages[0].Content)
+	assert.False(t, messages[0].CacheControl)
+
+	assert.Contains(t, messages[1].Content, "Todo Tools")
+	assert.True(t, messages[1].CacheControl)
+}
+
+func TestGetMessages_CacheControlWithSummary(t *testing.T) {
+	t.Parallel()
+
+	// Caching contract pinned by this test:
+	//
+	//   - The last invariant system message gets a cache-control marker.
+	//   - The last caller-supplied extra (typically turn_start hook output)
+	//     ALSO gets a cache-control marker so stable per-session/per-day
+	//     extras (AddPromptFiles, AddEnvironmentInfo) participate in
+	//     prompt caching. This matches the prior
+	//     buildContextSpecificSystemMessages caching behavior.
+	//   - Summary and conversation messages are not cache-controlled.
+	testAgent := agent.New("root", "instructions",
+		agent.WithToolSets(todoToolSet(t)),
+	)
+
+	s := New()
+	s.Messages = append(s.Messages, Item{Summary: "Test summary"})
+
+	extra := chat.Message{
+		Role:    chat.MessageRoleSystem,
+		Content: "Today's date: 2026-04-25",
+	}
+	messages := s.GetMessages(testAgent, extra)
+
+	var checkpointIndices []int
+	for i, msg := range messages {
+		if msg.Role == chat.MessageRoleSystem && msg.CacheControl {
+			checkpointIndices = append(checkpointIndices, i)
+		}
+	}
+
+	require.Len(t, checkpointIndices, 2,
+		"invariant and last-extra messages should each be cache-controlled")
+
+	// Checkpoint #1: last invariant message (toolset instructions).
+	assert.Contains(t, messages[checkpointIndices[0]].Content, "Todo Tools",
+		"checkpoint #1 must land on the last invariant message")
+
+	// Checkpoint #2: last extra (the date system message).
+	assert.Equal(t, extra.Content, messages[checkpointIndices[1]].Content,
+		"checkpoint #2 must land on the last extra system message")
+
+	// The extra must come AFTER the invariant block.
+	assert.Greater(t, checkpointIndices[1], checkpointIndices[0],
+		"extras must come AFTER the invariant cache checkpoint")
+}
+
+func TestGetLastUserMessages(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty session returns empty slice", func(t *testing.T) {
+		t.Parallel()
+		s := New()
+		assert.Empty(t, s.GetLastUserMessages(2))
+	})
+
+	t.Run("session with fewer messages than requested returns all", func(t *testing.T) {
+		t.Parallel()
+		s := New()
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleUser,
+			Content: "Only message",
+		}))
+		msgs := s.GetLastUserMessages(2)
+		assert.Len(t, msgs, 1)
+		assert.Equal(t, "Only message", msgs[0])
+	})
+
+	t.Run("session returns last n user messages in order", func(t *testing.T) {
+		t.Parallel()
+		s := New()
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleUser,
+			Content: "First",
+		}))
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleAssistant,
+			Content: "Response 1",
+		}))
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleUser,
+			Content: "Second",
+		}))
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleAssistant,
+			Content: "Response 2",
+		}))
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleUser,
+			Content: "Third",
+		}))
+
+		msgs := s.GetLastUserMessages(2)
+		assert.Len(t, msgs, 2)
+		assert.Equal(t, "Second", msgs[0]) // Ordered oldest to newest
+		assert.Equal(t, "Third", msgs[1])
+	})
+
+	t.Run("skips empty user messages", func(t *testing.T) {
+		t.Parallel()
+		s := New()
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleUser,
+			Content: "First",
+		}))
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleUser,
+			Content: "   ", // Empty after trim
+		}))
+		s.AddMessage(NewAgentMessage("", &chat.Message{
+			Role:    chat.MessageRoleUser,
+			Content: "Third",
+		}))
+
+		msgs := s.GetLastUserMessages(2)
+		assert.Len(t, msgs, 2)
+		assert.Equal(t, "First", msgs[0])
+		assert.Equal(t, "Third", msgs[1])
+	})
+}
+
+func TestMessageUnmarshalJSONAgentNameCompat(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "current key",
+			input: `{"agent_name":"root","message":{"role":"user","content":"hi"}}`,
+			want:  "root",
+		},
+		{
+			name:  "legacy key",
+			input: `{"agentName":"root","message":{"role":"user","content":"hi"}}`,
+			want:  "root",
+		},
+		{
+			name:  "current key wins over legacy",
+			input: `{"agent_name":"new","agentName":"old","message":{"role":"user","content":"hi"}}`,
+			want:  "new",
+		},
+		{
+			name:  "legacy wins over empty current key",
+			input: `{"agent_name":"","agentName":"old","message":{"role":"user","content":"hi"}}`,
+			want:  "old",
+		},
+		{
+			name:  "no agent name",
+			input: `{"message":{"role":"user","content":"hi"}}`,
+			want:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var msg Message
+			require.NoError(t, json.Unmarshal([]byte(tt.input), &msg))
+			assert.Equal(t, tt.want, msg.AgentName)
+			assert.Equal(t, "hi", msg.Message.Content)
+		})
+	}
+
+	t.Run("null leaves receiver untouched", func(t *testing.T) {
+		t.Parallel()
+
+		msg := Message{AgentName: "root", Message: chat.Message{Content: "hi"}}
+		require.NoError(t, json.Unmarshal([]byte(`null`), &msg))
+		assert.Equal(t, "root", msg.AgentName)
+		assert.Equal(t, "hi", msg.Message.Content)
+	})
+
+	t.Run("legacy session document", func(t *testing.T) {
+		t.Parallel()
+
+		// Mirrors a pre-rename session export as loaded by the evaluation package.
+		legacy := `{
+			"id": "41b179a2-ed19-4ae2-a45d-95775aaa90f7",
+			"messages": [
+				{"message": {"agentName": "", "message": {"role": "user", "content": "How many files?"}}},
+				{"message": {"agentName": "root", "message": {"role": "assistant", "content": "Two."}}}
+			]
+		}`
+
+		var sess Session
+		require.NoError(t, json.Unmarshal([]byte(legacy), &sess))
+		require.Len(t, sess.Messages, 2)
+		assert.Empty(t, sess.Messages[0].Message.AgentName)
+		assert.Equal(t, "root", sess.Messages[1].Message.AgentName)
+		assert.Equal(t, "Two.", sess.Messages[1].Message.Message.Content)
+	})
+
+	t.Run("marshal emits agent_name", func(t *testing.T) {
+		t.Parallel()
+
+		out, err := json.Marshal(Message{AgentName: "root"})
+		require.NoError(t, err)
+		assert.Contains(t, string(out), `"agent_name":"root"`)
+		assert.NotContains(t, string(out), "agentName")
+	})
+}
+
+func TestEvalCriteriaUnmarshalJSON(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		want    EvalCriteria
+		wantErr bool
+	}{
+		{
+			name:  "valid fields",
+			input: `{"relevance":["is correct"],"size":"M","setup":"echo hello","working_dir":"mydir"}`,
+			want: EvalCriteria{
+				Relevance:  []string{"is correct"},
+				Size:       "M",
+				Setup:      "echo hello",
+				WorkingDir: "mydir",
+			},
+		},
+		{
+			name:  "valid with assertions",
+			input: `{"relevance":[],"assertions":[{"name":"has greeting","type":"contains","value":"hello"}]}`,
+			want: EvalCriteria{
+				Relevance:  []string{},
+				Assertions: []Assertion{{Name: "has greeting", Type: "contains", Value: "hello"}},
+			},
+		},
+		{
+			name:  "empty object",
+			input: `{}`,
+			want:  EvalCriteria{},
+		},
+		{
+			name:    "unknown field rejected",
+			input:   `{"relevance":[],"unknown_field":"value"}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var got EvalCriteria
+			err := json.Unmarshal([]byte(tt.input), &got)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestSanitizeToolCalls(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no-op when all tool calls have results", func(t *testing.T) {
+		t.Parallel()
+		messages := []chat.Message{
+			{Role: chat.MessageRoleUser, Content: "hi"},
+			{
+				Role: chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{
+					{ID: "tc1", Function: tools.FunctionCall{Name: "shell"}},
+				},
+			},
+			{Role: chat.MessageRoleTool, ToolCallID: "tc1", Content: "ok"},
+			{Role: chat.MessageRoleAssistant, Content: "done"},
+		}
+		result := sanitizeToolCalls(messages)
+		assert.Equal(t, messages, result)
+	})
+
+	t.Run("injects synthetic result for missing tool result", func(t *testing.T) {
+		t.Parallel()
+		messages := []chat.Message{
+			{Role: chat.MessageRoleUser, Content: "hi"},
+			{
+				Role: chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{
+					{ID: "tc1", Function: tools.FunctionCall{Name: "shell"}},
+				},
+			},
+		}
+		result := sanitizeToolCalls(messages)
+
+		require.Len(t, result, 3)
+		assert.Equal(t, chat.MessageRoleTool, result[2].Role)
+		assert.Equal(t, "tc1", result[2].ToolCallID)
+		assert.True(t, result[2].IsError)
+		assert.Equal(t, "No result provided", result[2].Content)
+	})
+
+	t.Run("handles multiple tool calls with partial results", func(t *testing.T) {
+		t.Parallel()
+		messages := []chat.Message{
+			{Role: chat.MessageRoleUser, Content: "hi"},
+			{
+				Role: chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{
+					{ID: "tc1", Function: tools.FunctionCall{Name: "read_file"}},
+					{ID: "tc2", Function: tools.FunctionCall{Name: "write_file"}},
+					{ID: "tc3", Function: tools.FunctionCall{Name: "shell"}},
+				},
+			},
+			{Role: chat.MessageRoleTool, ToolCallID: "tc1", Content: "file contents"},
+			// tc2 and tc3 are missing
+		}
+		result := sanitizeToolCalls(messages)
+
+		// Original 3 messages + 2 synthetic results
+		require.Len(t, result, 5)
+
+		// assistant, then existing tc1 result, then synthetics for tc2/tc3 flushed at end
+		assert.Equal(t, chat.MessageRoleAssistant, result[1].Role)
+		assert.Equal(t, "tc1", result[2].ToolCallID)
+		assert.False(t, result[2].IsError)
+		assert.Equal(t, "tc2", result[3].ToolCallID)
+		assert.True(t, result[3].IsError)
+		assert.Equal(t, "tc3", result[4].ToolCallID)
+		assert.True(t, result[4].IsError)
+	})
+
+	t.Run("no tool calls at all is a no-op", func(t *testing.T) {
+		t.Parallel()
+		messages := []chat.Message{
+			{Role: chat.MessageRoleUser, Content: "hello"},
+			{Role: chat.MessageRoleAssistant, Content: "hi there"},
+		}
+		result := sanitizeToolCalls(messages)
+		assert.Equal(t, messages, result)
+	})
+
+	t.Run("multiple assistant messages with missing results", func(t *testing.T) {
+		t.Parallel()
+		messages := []chat.Message{
+			{Role: chat.MessageRoleUser, Content: "hi"},
+			{
+				Role:      chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{{ID: "tc1"}},
+			},
+			{Role: chat.MessageRoleTool, ToolCallID: "tc1", Content: "ok"},
+			{
+				Role:      chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{{ID: "tc2"}},
+			},
+			// tc2 result missing (crash)
+		}
+		result := sanitizeToolCalls(messages)
+
+		require.Len(t, result, 5)
+		assert.Equal(t, "tc2", result[4].ToolCallID)
+		assert.True(t, result[4].IsError)
+	})
+
+	t.Run("flushes synthetics before next user message", func(t *testing.T) {
+		t.Parallel()
+		messages := []chat.Message{
+			{Role: chat.MessageRoleUser, Content: "hi"},
+			{
+				Role:      chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{{ID: "tc1", Function: tools.FunctionCall{Name: "shell"}}},
+			},
+			// no tool result — user responds before result arrives
+			{Role: chat.MessageRoleUser, Content: "never mind"},
+			{Role: chat.MessageRoleAssistant, Content: "ok"},
+		}
+		result := sanitizeToolCalls(messages)
+
+		// synthetic tc1 result should be injected before the second user message
+		require.Len(t, result, 5)
+		assert.Equal(t, chat.MessageRoleAssistant, result[1].Role)
+		assert.Equal(t, "tc1", result[2].ToolCallID)
+		assert.True(t, result[2].IsError)
+		assert.Equal(t, chat.MessageRoleUser, result[3].Role)
+		assert.Equal(t, chat.MessageRoleAssistant, result[4].Role)
+	})
+
+	t.Run("flushes synthetics before next assistant with tool calls", func(t *testing.T) {
+		t.Parallel()
+		messages := []chat.Message{
+			{Role: chat.MessageRoleUser, Content: "hi"},
+			{
+				Role:      chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{{ID: "tc1"}},
+			},
+			// no result for tc1, model immediately issues another tool call
+			{
+				Role:      chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{{ID: "tc2"}},
+			},
+			{Role: chat.MessageRoleTool, ToolCallID: "tc2", Content: "ok"},
+		}
+		result := sanitizeToolCalls(messages)
+
+		require.Len(t, result, 5)
+		// synthetic for tc1 inserted before the second assistant message
+		assert.Equal(t, "tc1", result[2].ToolCallID)
+		assert.True(t, result[2].IsError)
+		assert.Len(t, result[3].ToolCalls, 1)
+		assert.Equal(t, "tc2", result[3].ToolCalls[0].ID)
+		assert.Equal(t, "tc2", result[4].ToolCallID)
+		assert.False(t, result[4].IsError)
+	})
+
+	t.Run("empty messages returns empty", func(t *testing.T) {
+		t.Parallel()
+		result := sanitizeToolCalls(nil)
+		assert.Nil(t, result)
+
+		result = sanitizeToolCalls([]chat.Message{})
+		assert.Empty(t, result)
+	})
+}
+
+func TestGetMessages_SanitizesOrphanedToolCalls(t *testing.T) {
+	t.Parallel()
+
+	testAgent := &agent.Agent{}
+
+	s := New()
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role:    chat.MessageRoleUser,
+		Content: "do something",
+	}))
+	s.AddMessage(NewAgentMessage("", &chat.Message{
+		Role: chat.MessageRoleAssistant,
+		ToolCalls: []tools.ToolCall{
+			{ID: "orphan1", Function: tools.FunctionCall{Name: "shell"}},
+			{ID: "orphan2", Function: tools.FunctionCall{Name: "read_file"}},
+		},
+	}))
+	// No tool result messages — simulating a crash mid-run
+
+	messages := s.GetMessages(testAgent)
+
+	// Verify every tool call ID has a matching tool result
+	callIDs := make(map[string]bool)
+	resultIDs := make(map[string]bool)
+	for _, msg := range messages {
+		for _, tc := range msg.ToolCalls {
+			callIDs[tc.ID] = true
+		}
+		if msg.Role == chat.MessageRoleTool {
+			resultIDs[msg.ToolCallID] = true
+		}
+	}
+	for id := range callIDs {
+		assert.True(t, resultIDs[id], "tool call %s should have a matching result", id)
+	}
+}
+
+func TestTransferTaskPromptExcludesParents(t *testing.T) {
+	t.Parallel()
+
+	// Build hierarchy: planner -> root -> librarian
+	// root's sub-agents: [librarian]
+	// root's parents: [planner] (set by planner listing root as a sub-agent)
+	librarian := agent.New("librarian", "", agent.WithDescription("Library agent"))
+	root := agent.New("root", "You are the root agent",
+		agent.WithDescription("Root agent"),
+	)
+	planner := agent.New("planner", "",
+		agent.WithDescription("Planner agent"),
+	)
+	// Connect: root -> librarian (root has librarian as sub-agent)
+	agent.WithSubAgents(librarian)(root)
+	// Connect: planner -> root (planner has root as sub-agent, making root's parent = planner)
+	agent.WithSubAgents(root)(planner)
+
+	// Verify parent relationship was established
+	require.Len(t, root.Parents(), 1)
+	assert.Equal(t, "planner", root.Parents()[0].Name())
+
+	s := New()
+	messages := s.GetMessages(root)
+
+	// Find the system message about sub-agents
+	var subAgentMsg string
+	for _, msg := range messages {
+		if msg.Role == chat.MessageRoleSystem && strings.Contains(msg.Content, "transfer_task") {
+			subAgentMsg = msg.Content
+			break
+		}
+	}
+
+	require.NotEmpty(t, subAgentMsg, "should have a sub-agent system message")
+	assert.Contains(t, subAgentMsg, "librarian", "should list librarian as a valid sub-agent")
+	assert.NotContains(t, subAgentMsg, "planner", "should NOT list parent agent planner as a valid transfer target")
+}
+
+func TestNormalizeMessageContent(t *testing.T) {
+	t.Parallel()
+
+	img := chat.MessagePart{Type: chat.MessagePartTypeImageURL, ImageURL: &chat.MessageImageURL{URL: "data:image/png;base64,AAAA"}}
+
+	tests := []struct {
+		name  string
+		input []chat.Message
+		want  []chat.Message
+	}{
+		{
+			name:  "empty input",
+			input: nil,
+			want:  nil,
+		},
+		{
+			name: "whitespace-only user message dropped",
+			input: []chat.Message{
+				{Role: chat.MessageRoleUser, Content: "   \n\t  "},
+			},
+			want: nil,
+		},
+		{
+			name: "whitespace-only system message dropped",
+			input: []chat.Message{
+				{Role: chat.MessageRoleSystem, Content: "  "},
+			},
+			want: nil,
+		},
+		{
+			name: "whitespace-only assistant message dropped",
+			input: []chat.Message{
+				{Role: chat.MessageRoleAssistant, Content: "\t\n"},
+			},
+			want: nil,
+		},
+		{
+			name: "assistant with empty content but tool calls is kept",
+			input: []chat.Message{
+				{Role: chat.MessageRoleAssistant, Content: "", ToolCalls: []tools.ToolCall{{ID: "tc1"}}},
+			},
+			want: []chat.Message{
+				{Role: chat.MessageRoleAssistant, Content: "", ToolCalls: []tools.ToolCall{{ID: "tc1"}}},
+			},
+		},
+		{
+			name: "tool result always forwarded even if whitespace-only",
+			input: []chat.Message{
+				{Role: chat.MessageRoleTool, Content: "   ", ToolCallID: "t1"},
+			},
+			want: []chat.Message{
+				{Role: chat.MessageRoleTool, Content: "   ", ToolCallID: "t1"},
+			},
+		},
+		{
+			name: "non-empty messages preserved verbatim including leading/trailing space",
+			input: []chat.Message{
+				{Role: chat.MessageRoleUser, Content: "  hello  "},
+			},
+			want: []chat.Message{
+				{Role: chat.MessageRoleUser, Content: "  hello  "},
+			},
+		},
+		{
+			name: "whitespace-only text part stripped from MultiContent",
+			input: []chat.Message{
+				{Role: chat.MessageRoleUser, MultiContent: []chat.MessagePart{
+					{Type: chat.MessagePartTypeText, Text: "   "},
+					img,
+				}},
+			},
+			want: []chat.Message{
+				{Role: chat.MessageRoleUser, MultiContent: []chat.MessagePart{img}},
+			},
+		},
+		{
+			name: "message dropped when all MultiContent parts are whitespace-only text",
+			input: []chat.Message{
+				{Role: chat.MessageRoleUser, MultiContent: []chat.MessagePart{
+					{Type: chat.MessagePartTypeText, Text: "   "},
+					{Type: chat.MessagePartTypeText, Text: "\t"},
+				}},
+			},
+			want: nil,
+		},
+		{
+			name: "image-only MultiContent message preserved",
+			input: []chat.Message{
+				{Role: chat.MessageRoleUser, MultiContent: []chat.MessagePart{img}},
+			},
+			want: []chat.Message{
+				{Role: chat.MessageRoleUser, MultiContent: []chat.MessagePart{img}},
+			},
+		},
+		{
+			name: "mix: valid and whitespace messages",
+			input: []chat.Message{
+				{Role: chat.MessageRoleSystem, Content: "be helpful"},
+				{Role: chat.MessageRoleUser, Content: "  "},
+				{Role: chat.MessageRoleUser, Content: "hello"},
+				{Role: chat.MessageRoleTool, Content: "", ToolCallID: "t1"},
+			},
+			want: []chat.Message{
+				{Role: chat.MessageRoleSystem, Content: "be helpful"},
+				{Role: chat.MessageRoleUser, Content: "hello"},
+				{Role: chat.MessageRoleTool, Content: "", ToolCallID: "t1"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := normalizeMessageContent(tt.input)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCompactionInput(t *testing.T) {
+	t.Parallel()
+
+	newMsg := func(role chat.MessageRole, content string) Item {
+		return NewMessageItem(&Message{Message: chat.Message{Role: role, Content: content}})
+	}
+
+	t.Run("empty session returns empty", func(t *testing.T) {
+		t.Parallel()
+		sess := New()
+		messages, sessIndices, itemCount := sess.CompactionInput()
+		assert.Empty(t, messages)
+		assert.Empty(t, sessIndices)
+		assert.Zero(t, itemCount)
+	})
+
+	t.Run("system messages on the session are filtered out", func(t *testing.T) {
+		t.Parallel()
+		sess := New(WithMessages([]Item{
+			newMsg(chat.MessageRoleSystem, "sys"),
+			newMsg(chat.MessageRoleUser, "u1"),
+			newMsg(chat.MessageRoleAssistant, "a1"),
+			newMsg(chat.MessageRoleSystem, "sys2"),
+			newMsg(chat.MessageRoleUser, "u2"),
+		}))
+
+		messages, sessIndices, itemCount := sess.CompactionInput()
+		require.Len(t, messages, 3)
+		assert.Equal(t, []int{1, 2, 4}, sessIndices)
+		assert.Equal(t, "u1", messages[0].Content)
+		assert.Equal(t, "a1", messages[1].Content)
+		assert.Equal(t, "u2", messages[2].Content)
+		assert.Equal(t, len(sess.Messages), itemCount)
+	})
+
+	t.Run("prior summary surfaces synthetic message and starts at FirstKeptEntry", func(t *testing.T) {
+		t.Parallel()
+		items := []Item{
+			newMsg(chat.MessageRoleUser, "u0"),
+			newMsg(chat.MessageRoleAssistant, "a0"),
+			newMsg(chat.MessageRoleUser, "u1-kept"),
+			newMsg(chat.MessageRoleAssistant, "a1-kept"),
+			{Summary: "prior summary", FirstKeptEntry: 2},
+			newMsg(chat.MessageRoleUser, "u2"),
+			newMsg(chat.MessageRoleAssistant, "a2"),
+		}
+		sess := New(WithMessages(items))
+
+		messages, sessIndices, itemCount := sess.CompactionInput()
+
+		require.Len(t, messages, 5)
+		assert.Equal(t, chat.MessageRoleUser, messages[0].Role)
+		assert.Contains(t, messages[0].Content, "Session Summary: prior summary")
+		// The synthetic message maps back to the prior summary item; the
+		// kept-tail then resumes at the prior FirstKeptEntry, skipping
+		// the (non-message) summary item itself.
+		assert.Equal(t, []int{4, 2, 3, 5, 6}, sessIndices)
+		assert.Equal(t, len(items), itemCount)
+	})
+
+	t.Run("prior summary without FirstKeptEntry starts strictly after the summary", func(t *testing.T) {
+		t.Parallel()
+		items := []Item{
+			newMsg(chat.MessageRoleUser, "old"),
+			newMsg(chat.MessageRoleAssistant, "old-reply"),
+			{Summary: "prior summary"},
+			newMsg(chat.MessageRoleUser, "new"),
+			newMsg(chat.MessageRoleAssistant, "new-reply"),
+		}
+		sess := New(WithMessages(items))
+
+		messages, sessIndices, itemCount := sess.CompactionInput()
+
+		require.Len(t, messages, 3)
+		assert.Equal(t, []int{2, 3, 4}, sessIndices)
+		assert.Equal(t, len(items), itemCount)
+	})
+
+	t.Run("returned messages are independent copies safe to mutate", func(t *testing.T) {
+		t.Parallel()
+		sess := New(WithMessages([]Item{
+			NewMessageItem(&Message{Message: chat.Message{
+				Role:         chat.MessageRoleUser,
+				Content:      "hello",
+				Cost:         1.5,
+				CacheControl: true,
+			}}),
+		}))
+
+		messages, _, _ := sess.CompactionInput()
+		require.Len(t, messages, 1)
+
+		messages[0].Cost = 0
+		messages[0].CacheControl = false
+		messages[0].Content = "mutated"
+
+		assert.InDelta(t, 1.5, sess.Messages[0].Message.Message.Cost, 0)
+		assert.True(t, sess.Messages[0].Message.Message.CacheControl)
+		assert.Equal(t, "hello", sess.Messages[0].Message.Message.Content)
+	})
+}
+
+// TestEmbeddedSubSessionCost distinguishes sub-sessions embedded at load time
+// (hydrated items carry no live-attached marker) from sub-sessions attached
+// live via AddLiveSubSession: only the former count, because live
+// sub-sessions report their own cost through their own TokenUsageEvents.
+func TestEmbeddedSubSessionCost(t *testing.T) {
+	t.Parallel()
+
+	costItem := func(cost float64) Item {
+		return Item{Message: &Message{Message: chat.Message{Role: chat.MessageRoleAssistant, Cost: cost}}}
+	}
+
+	sess := New()
+	sess.Messages = append(sess.Messages, costItem(0.10))
+
+	// Restored shape: hydration appends sub-session items directly.
+	embedded := New(WithParentID(sess.ID))
+	embedded.Messages = append(embedded.Messages, costItem(0.05))
+	nested := New(WithParentID(embedded.ID))
+	nested.Messages = append(nested.Messages, costItem(0.01))
+	embedded.Messages = append(embedded.Messages, Item{SubSession: nested})
+	sess.Messages = append(sess.Messages, Item{SubSession: embedded})
+
+	// Live shape: the sub-session completed during this process.
+	live := New(WithParentID(sess.ID))
+	live.Messages = append(live.Messages, costItem(0.02))
+	sess.AddLiveSubSession(live)
+
+	assert.InDelta(t, 0.06, sess.EmbeddedSubSessionCost(), 1e-9, "embedded sub-sessions count recursively")
+	assert.InDelta(t, 0.10, sess.OwnCost(), 1e-9)
+	assert.InDelta(t, 0.18, sess.TotalCost(), 1e-9, "TotalCost counts embedded and live sub-sessions")
+}
+
+// TestGetAllErrors verifies recorded errors are collected in item order,
+// including from sub-sessions, and that GetAllMessages keeps excluding them.
+func TestGetAllErrors(t *testing.T) {
+	t.Parallel()
+
+	sess := New(WithUserMessage("hi"))
+	sess.AddError(&Error{Message: "first failure", Code: "model_error", AgentName: "root"})
+
+	sub := New(WithParentID(sess.ID))
+	sub.AddError(&Error{Message: "sub failure", Code: "tool_failed", AgentName: "child"})
+	sess.AddSubSession(sub)
+
+	sess.AddError(&Error{Message: "second failure", Code: "context_exceeded", AgentName: "root"})
+
+	errs := sess.GetAllErrors()
+	require.Len(t, errs, 3)
+	assert.Equal(t, "first failure", errs[0].Message)
+	assert.Equal(t, "sub failure", errs[1].Message)
+	assert.Equal(t, "second failure", errs[2].Message)
+	assert.Equal(t, "context_exceeded", errs[2].Code)
+
+	for _, msg := range sess.GetAllMessages() {
+		assert.NotContains(t, msg.Message.Content, "failure", "errors must not leak into messages")
+	}
+}
+
+func TestGetMessagesUsageOnlyDoesNotConsumeHistoryLimit(t *testing.T) {
+	t.Parallel()
+
+	s := New(WithMessages([]Item{
+		NewMessageItem(UserMessage("question")),
+		NewMessageItem(&Message{Message: chat.Message{Role: chat.MessageRoleAssistant, Content: "answer"}}),
+		NewMessageItem(&Message{Message: chat.Message{Role: chat.MessageRoleAssistant, Usage: &chat.Usage{InputTokens: 10}, Cost: 0.01}}),
+	}))
+	a := agent.New("root", "", agent.WithNumHistoryItems(2))
+	var conversation []chat.Message
+	for _, msg := range s.GetMessages(a) {
+		if msg.Role != chat.MessageRoleSystem {
+			conversation = append(conversation, msg)
+		}
+	}
+	require.Len(t, conversation, 2)
+	assert.Equal(t, "question", conversation[0].Content)
+	assert.Equal(t, "answer", conversation[1].Content)
+	assert.InDelta(t, 0.01, s.TotalCost(), 1e-9)
+}

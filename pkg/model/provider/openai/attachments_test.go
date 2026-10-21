@@ -1,0 +1,181 @@
+package openai
+
+import (
+	"bytes"
+	"encoding/base64"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/modelinfo"
+)
+
+// minJPEG is a minimal JPEG magic-byte header for use in tests.
+var minJPEG = []byte{0xFF, 0xD8, 0xFF, 0xE0}
+
+// TestConvertDocumentResponseInput_StrategyB64_Image verifies that an image
+// document with InlineData and a vision-capable model produces a native image
+// part (OfInputImage) with a data-URI.
+func TestConvertDocumentResponseInput_StrategyB64_Image(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{
+		Name:     "photo.jpg",
+		MimeType: "image/jpeg",
+		Source:   chat.DocumentSource{InlineData: minJPEG},
+	}
+
+	visionCaps := modelinfo.CapsWith(true, true)
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, visionCaps)
+	require.NoError(t, err)
+	require.Len(t, parts, 1, "expected exactly one image part")
+	require.NotNil(t, parts[0].OfInputImage, "expected OfInputImage, not text")
+	assert.Nil(t, parts[0].OfInputText, "expected no text part for B64 image")
+
+	wantB64 := base64.StdEncoding.EncodeToString(minJPEG)
+	imageURL := parts[0].OfInputImage.ImageURL.Value
+	assert.Equal(t, "data:image/jpeg;base64,"+wantB64, imageURL)
+}
+
+// TestConvertDocumentResponseInput_StrategyB64_ImageDropped verifies that an
+// image is dropped for a text-only model.
+func TestConvertDocumentResponseInput_StrategyB64_PDF(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{
+		Name:     "report.pdf",
+		MimeType: "application/pdf",
+		Source:   chat.DocumentSource{InlineData: []byte("%PDF")},
+	}
+
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, modelinfo.CapsWith(false, true))
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+	require.NotNil(t, parts[0].OfInputFile)
+	assert.Equal(t, "report.pdf", parts[0].OfInputFile.Filename.Value)
+	assert.Equal(t, "data:application/pdf;base64,JVBERg==", parts[0].OfInputFile.FileData.Value)
+}
+
+func TestConvertDocumentResponseInput_StrategyB64_ImageDropped(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{
+		Name:     "photo.jpg",
+		MimeType: "image/jpeg",
+		Source:   chat.DocumentSource{InlineData: minJPEG},
+	}
+
+	textOnlyCaps := modelinfo.CapsWith(false, false)
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, textOnlyCaps)
+	require.NoError(t, err)
+	assert.Nil(t, parts, "image should be dropped for text-only model")
+}
+
+func TestConvertDocumentResponseInput_StrategyTXT(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{
+		Name:     "spec.md",
+		MimeType: "text/markdown",
+		Source:   chat.DocumentSource{InlineText: "## API Spec"},
+	}
+
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, modelinfo.ModelCapabilities{})
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+	require.NotNil(t, parts[0].OfInputText)
+	text := parts[0].OfInputText.Text
+	assert.Contains(t, text, "spec-md")
+	assert.Contains(t, text, "text-markdown")
+	assert.Contains(t, text, "## API Spec")
+}
+
+func TestConvertDocumentResponseInput_StrategyTXT_Envelope(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{
+		Name:     "data.csv",
+		MimeType: "text/csv",
+		Source:   chat.DocumentSource{InlineText: "x,y"},
+	}
+
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, modelinfo.ModelCapabilities{})
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+	require.NotNil(t, parts[0].OfInputText)
+	text := parts[0].OfInputText.Text
+	assert.True(t, strings.HasPrefix(text, "<document"), "should be wrapped in envelope")
+}
+
+func TestConvertDocumentResponseInput_Drop_NoContent(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{
+		Name:     "empty.md",
+		MimeType: "text/markdown",
+		Source:   chat.DocumentSource{},
+	}
+
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, modelinfo.ModelCapabilities{})
+	require.NoError(t, err)
+	assert.Nil(t, parts, "should be nil when no inline content")
+}
+
+func TestConvertDocumentResponseInput_StrategyB64_PreservesMIMEType(t *testing.T) {
+	t.Parallel()
+
+	for _, mimeType := range []string{"image/PNG", "application/PDF"} {
+		t.Run(mimeType, func(t *testing.T) {
+			t.Parallel()
+			doc := chat.Document{
+				MimeType: mimeType,
+				Source:   chat.DocumentSource{InlineData: []byte{0xff}},
+			}
+			parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, modelinfo.CapsWith(true, true))
+			require.NoError(t, err)
+			require.Len(t, parts, 1)
+			if mimeType == "image/PNG" {
+				require.NotNil(t, parts[0].OfInputImage)
+				assert.Equal(t, "data:image/PNG;base64,/w==", parts[0].OfInputImage.ImageURL.Value)
+			} else {
+				require.NotNil(t, parts[0].OfInputFile)
+				assert.Equal(t, "data:application/PDF;base64,/w==", parts[0].OfInputFile.FileData.Value)
+			}
+		})
+	}
+}
+
+func BenchmarkConvertDocumentResponseInputB64(b *testing.B) {
+	for _, mimeType := range []string{"image/png", "application/pdf"} {
+		b.Run(mimeType, func(b *testing.B) {
+			doc := chat.Document{
+				MimeType: mimeType,
+				Source:   chat.DocumentSource{InlineData: bytes.Repeat([]byte{0xff}, 1<<20)},
+			}
+			caps := modelinfo.CapsWith(true, true)
+			ctx := b.Context()
+			b.ReportAllocs()
+			b.SetBytes(int64(len(doc.Source.InlineData)))
+			for b.Loop() {
+				if _, err := convertDocumentToResponseInputWithCaps(ctx, doc, caps); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestConvertDocumentResponseInput_JSONText(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{Name: "settings.json", MimeType: "application/json", Source: chat.DocumentSource{InlineText: `{"enabled":true}`}}
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, modelinfo.ModelCapabilities{})
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+	require.NotNil(t, parts[0].OfInputText)
+	assert.Contains(t, parts[0].OfInputText.Text, doc.Source.InlineText)
+}
+
+func TestResponseInputDoesNotEncodeAudioAsFile(t *testing.T) {
+	t.Parallel()
+	doc := chat.Document{Name: "audio", MimeType: "audio/wav", Source: chat.DocumentSource{InlineData: []byte{1, 2, 3}}}
+	parts, err := convertDocumentToResponseInputWithCaps(t.Context(), doc, modelinfo.CapsWith(false, false, true, false))
+	require.NoError(t, err)
+	assert.Empty(t, parts)
+}

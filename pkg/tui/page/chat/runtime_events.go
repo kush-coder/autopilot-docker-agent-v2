@@ -1,0 +1,643 @@
+package chat
+
+import (
+	"cmp"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+
+	"github.com/docker/docker-agent/pkg/runtime"
+	"github.com/docker/docker-agent/pkg/sound"
+	"github.com/docker/docker-agent/pkg/tools"
+	builtinshell "github.com/docker/docker-agent/pkg/tools/builtin/shell"
+	"github.com/docker/docker-agent/pkg/tui/components/messages"
+	"github.com/docker/docker-agent/pkg/tui/components/notification"
+	"github.com/docker/docker-agent/pkg/tui/components/sidebar"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/dialog"
+	msgtypes "github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/types"
+	"github.com/docker/docker-agent/pkg/userconfig"
+)
+
+// Runtime Event Handling
+//
+// This file maps runtime events to UI updates, following the Elm Architecture
+// pattern of explicit event-to-update mappings. Events are organized by category:
+//
+// Stream Lifecycle:
+//   - StreamStartedEvent  → Start spinners, set pending response
+//   - StreamStoppedEvent  → Stop spinners, process queue, maybe exit
+//
+// Content Events:
+//   - AgentChoiceEvent         → Append text to message
+//   - AgentChoiceReasoningEvent → Append reasoning block
+//   - UserMessageEvent         → Replace loading with user message
+//   - MessageAddedEvent        → Render generated media (local runs only)
+//
+// Tool Events:
+//   - PartialToolCallEvent      → Show tool call in progress
+//   - ToolCallEvent             → Tool execution started
+//   - ToolCallConfirmationEvent → Show confirmation dialog
+//   - ToolCallOutputEvent       → Append live tool output
+//   - ToolCallResponseEvent     → Show tool result
+//
+// Sidebar Updates (forwarded):
+//   - TokenUsageEvent, AgentInfoEvent, TeamInfoEvent, etc.
+//   - BudgetUsageEvent          → Live run-budget reading
+//
+// Warnings:
+//   - BudgetExceededEvent       → Run stopped by its budget
+//
+// Dialogs:
+//   - MaxIterationsReachedEvent → Show max iterations dialog
+//   - ElicitationRequestEvent   → Show elicitation/OAuth dialog
+
+// handleRuntimeEvent processes runtime events and returns the appropriate command.
+// Returns (handled, cmd) where handled indicates if the event was processed.
+//
+// The switch is organized by event category for clarity.
+func (p *chatPage) handleRuntimeEvent(msg tea.Msg) (bool, tea.Cmd) {
+	switch msg := msg.(type) {
+	// ===== Error and Warning Events =====
+	case *runtime.ErrorEvent:
+		if userconfig.Get().GetSound() {
+			sound.Play(p.ctx(), sound.Failure)
+		}
+		return true, p.messages.AddErrorMessage(msg.Error)
+
+	case *runtime.WarningEvent:
+		return true, notification.WarningCmd(msg.Message)
+
+	case *runtime.ModelFallbackEvent:
+		// Update sidebar with the fallback model immediately so it reflects the switch
+		sidebarCmd := p.sidebar.SetAgentInfo(msg.AgentName, msg.FallbackModel, "", 0, "", 0)
+		// Notify user when switching to a fallback model, include the reason
+		fallbackMsg := fmt.Sprintf("Model %s failed (%s), switching to %s", msg.FailedModel, msg.Reason, msg.FallbackModel)
+		return true, tea.Batch(sidebarCmd, notification.WarningCmd(fallbackMsg))
+
+	// ===== Stream Lifecycle Events =====
+	case *runtime.StreamStartedEvent:
+		return true, p.handleStreamStarted(msg)
+
+	case *runtime.SessionRecoveredEvent:
+		if p.isSubSessionEvent(msg.SessionID) {
+			return true, nil
+		}
+		p.streamDepth = 0
+		p.agentStack = nil
+		p.msgCancel = nil
+		p.streamCancelled = false
+		p.contentIdentity.Finish(p.contentSession(msg.SessionID))
+		p.sidebar.ResetStreamTracking()
+		model, cleanup := p.messages.Update(msg)
+		p.messages = model.(messages.Model)
+		return true, tea.Batch(cleanup, p.forwardToSidebar(msg), p.setWorking(false), p.setPendingResponse(false))
+	case *runtime.StreamStoppedEvent:
+		return true, p.handleStreamStopped(msg)
+
+	// ===== Content Events =====
+	case *runtime.UserMessageEvent:
+		p.showStartupBanner = false
+		p.consumePendingMessage(msg.Message)
+		return true, p.messages.ReplaceLoadingWithUser(msg.Message, msg.SessionPosition)
+
+	case *runtime.AgentChoiceEvent:
+		return true, p.handleAgentChoice(msg)
+
+	case *runtime.AgentChoiceReasoningEvent:
+		return true, p.handleAgentChoiceReasoning(msg)
+
+	case *runtime.MessageAddedEvent:
+		return true, p.handleMessageAdded(msg)
+
+	case *runtime.ShellOutputEvent:
+		return true, p.handleShellCommand(msg)
+
+	// ===== Tool Events =====
+	case *runtime.PartialToolCallEvent:
+		return true, p.handlePartialToolCall(msg)
+
+	case *runtime.ToolCallEvent:
+		return true, p.handleToolCall(msg)
+
+	case *runtime.ToolCallConfirmationEvent:
+		return true, p.handleToolCallConfirmation(msg)
+
+	case *runtime.ToolCallOutputEvent:
+		return true, p.handleToolCallOutput(msg)
+
+	case *runtime.ToolCallResponseEvent:
+		return true, p.handleToolCallResponse(msg)
+
+	// ===== Sidebar Info Events (forwarded) =====
+	case *runtime.BackgroundAgentStatusEvent:
+		return true, p.forwardToSidebar(msg)
+
+	case *runtime.EvaluationUsageEvent:
+		if sess := p.app.Session(); sess != nil {
+			sess.AddEvaluationUsageRecord(msg.Evaluation)
+		}
+		return true, nil
+
+	case *runtime.TokenUsageEvent:
+		p.handleTokenUsage(msg)
+		return true, nil
+
+	case *runtime.AgentInfoEvent:
+		sidebarCmd := p.sidebar.SetAgentInfo(msg.AgentName, msg.Model, msg.Description, msg.ContextLimit, msg.CompactionModel, msg.PrimaryContextLimit)
+		if msg.WelcomeMessage != "" {
+			p.showStartupBanner = false
+		}
+		p.messages.AddWelcomeMessage(msg.WelcomeMessage)
+		return true, sidebarCmd
+
+	case *runtime.TeamInfoEvent:
+		p.sidebar.SetTeamInfo(msg.AvailableAgents)
+		return true, nil
+
+	case *runtime.AgentSwitchingEvent:
+		return true, p.handleAgentSwitching(msg)
+
+	case *runtime.AgentRouteEvent:
+		return true, notification.InfoCmd(routeSummary(msg))
+
+	case *runtime.ToolsetInfoEvent:
+		p.sidebar.SetSkillsInfo(len(p.app.CurrentAgentSkills()))
+		return true, p.forwardToSidebar(msg)
+
+	case *runtime.SessionTitleEvent:
+		return true, p.forwardToSidebar(msg)
+
+	case *runtime.SessionCompactionEvent:
+		// The sidebar tracks the started/completed pair to drive its
+		// "compacting…" gauge state (it ignores sessions it is not
+		// currently displaying).
+		sidebarCmd := p.forwardToSidebar(msg)
+		if p.isSubSessionEvent(msg.SessionID) {
+			// A sub-agent session compacting (threshold-triggered on a
+			// foreground child, or an explicit /context request on a live
+			// session) must not touch the root chat's work state: no
+			// clearing of msgCancel, no spinner flip, no queue processing.
+			return true, tea.Batch(sidebarCmd, subSessionCompactionNotice(msg))
+		}
+		if msg.Status == "completed" {
+			noticeCmd := rootCompactionNotice(msg)
+			if p.streamDepth > 0 {
+				// Automatic compaction nested in a live stream (the threshold
+				// fires after StreamStarted): update presentation only.
+				// Clearing msgCancel/working/queue here would break Esc and
+				// start queued messages against the live run (#3872);
+				// StreamStopped owns the cleanup.
+				return true, tea.Batch(sidebarCmd, noticeCmd)
+			}
+			// Standalone /compact runs outside any stream (Summarize emits no
+			// StreamStarted): this terminal event cleans up the work state.
+			p.msgCancel = nil
+			return true, tea.Batch(
+				sidebarCmd,
+				p.setWorking(false),
+				p.setPendingResponse(false),
+				p.processNextQueuedMessage(),
+				p.messages.ScrollToBottom(),
+				noticeCmd,
+			)
+		}
+		return true, sidebarCmd
+
+	// ===== RAG Indexing Events (forwarded to sidebar) =====
+	case *runtime.RAGIndexingStartedEvent,
+		*runtime.RAGIndexingProgressEvent,
+		*runtime.RAGIndexingCompletedEvent:
+		return true, p.forwardToSidebar(msg)
+
+	// ===== Budget Events =====
+	// budget_usage feeds the sidebar's live spend reading. budget_exceeded
+	// is rendered as a warning rather than a dialog: the run is already
+	// stopping and there is nothing to ask the user, unlike the iteration
+	// cap, which offers to continue.
+	case *runtime.BudgetUsageEvent:
+		return true, p.forwardToSidebar(msg)
+
+	case *runtime.BudgetExceededEvent:
+		return true, p.handleBudgetExceeded(msg)
+
+	// ===== Dialog Events =====
+	case *runtime.MaxIterationsReachedEvent:
+		return true, p.handleMaxIterationsReached(msg)
+
+	case *runtime.ElicitationRequestEvent:
+		return true, p.handleElicitationRequest(msg)
+	}
+
+	return false, nil
+}
+
+// forwardToSidebar forwards a message to the sidebar and returns the resulting command.
+func (p *chatPage) forwardToSidebar(msg tea.Msg) tea.Cmd {
+	slog.Debug("Forwarding event to sidebar", "event_type", fmt.Sprintf("%T", msg))
+	model, cmd := p.sidebar.Update(msg)
+	p.sidebar = model.(sidebar.Model)
+	return cmd
+}
+
+// isSubSessionEvent reports whether sessionID identifies a session other
+// than the page's root session. Events without a session ID are treated as
+// root events for backward compatibility.
+func (p *chatPage) isSubSessionEvent(sessionID string) bool {
+	if sessionID == "" || p.app == nil {
+		return false
+	}
+	sess := p.app.Session()
+	return sess != nil && sessionID != sess.ID
+}
+
+// rootCompactionNotice builds the root session's terminal compaction
+// feedback. Success is only announced when a summary was actually applied:
+// "failed" already surfaced an ErrorEvent; "skipped" means the compaction
+// was a no-op (nothing to compact, hook veto, empty model output). Empty
+// outcome (older servers) keeps the legacy success toast.
+func rootCompactionNotice(msg *runtime.SessionCompactionEvent) tea.Cmd {
+	switch msg.Outcome {
+	case "", runtime.CompactionOutcomeApplied:
+		return notification.SuccessCmd("Session compacted successfully.")
+	case runtime.CompactionOutcomeSkipped:
+		return notification.InfoCmd("Session compaction skipped.")
+	}
+	return nil
+}
+
+// subSessionCompactionNotice builds the agent-scoped feedback for a
+// sub-agent session's compaction: success, skipped or failed on the terminal
+// event, silence while it runs (the request itself was already announced).
+func subSessionCompactionNotice(msg *runtime.SessionCompactionEvent) tea.Cmd {
+	if msg.Status != "completed" {
+		return nil
+	}
+	agentLabel := msg.AgentName
+	if agentLabel == "" {
+		agentLabel = "sub-agent"
+	}
+	switch msg.Outcome {
+	case "", runtime.CompactionOutcomeApplied:
+		return notification.SuccessCmd(fmt.Sprintf("Compacted %s's session.", agentLabel))
+	case runtime.CompactionOutcomeSkipped:
+		return notification.InfoCmd(fmt.Sprintf("Compaction skipped for %s's session.", agentLabel))
+	case runtime.CompactionOutcomeFailed:
+		return notification.ErrorCmd(fmt.Sprintf("Compaction failed for %s's session.", agentLabel))
+	}
+	return nil
+}
+
+// handleTokenUsage updates sidebar and session with token usage data.
+// This handler performs side effects only and returns no command.
+func (p *chatPage) handleTokenUsage(msg *runtime.TokenUsageEvent) {
+	p.sidebar.SetTokenUsage(msg)
+	if msg.Usage != nil {
+		if sess := p.app.Session(); sess != nil {
+			// Only update the parent session's token counts when the event
+			// belongs to this session. Sub-sessions emit their own
+			// TokenUsageEvents with a different SessionID; writing those
+			// values into the parent would overwrite the parent's own
+			// context-tracking counters.
+			if msg.SessionID == "" || msg.SessionID == sess.ID {
+				sess.SetUsage(msg.Usage.InputTokens, msg.Usage.OutputTokens)
+			}
+
+			// Track per-message usage for /cost dialog
+			if msg.Usage.LastMessage != nil {
+				sess.AddMessageUsageRecordForSession(
+					cmp.Or(msg.SessionID, sess.ID),
+					msg.AgentName,
+					msg.Usage.LastMessage.Model,
+					msg.Usage.LastMessage.Cost,
+					&msg.Usage.LastMessage.Usage,
+				)
+			}
+		}
+	}
+}
+
+func (p *chatPage) handleStreamStarted(msg *runtime.StreamStartedEvent) tea.Cmd {
+	slog.Debug("handleStreamStarted called", "agent", msg.AgentName, "session_id", msg.SessionID)
+	p.contentIdentity.Finish(p.contentSession(msg.SessionID))
+	if p.contentSessionID == p.contentSession(msg.SessionID) {
+		p.messages.BreakMessageGroup()
+	}
+	p.streamCancelled = false
+	p.streamDepth++
+	p.agentStack = append(p.agentStack, msg.AgentName)
+	p.streamStartTime = time.Now()
+	spinnerCmd := p.setWorking(true)
+	pendingCmd := p.setPendingResponse(true)
+	sidebarCmd := p.forwardToSidebar(msg)
+	return tea.Batch(pendingCmd, spinnerCmd, sidebarCmd)
+}
+
+func (p *chatPage) contentSession(sessionID string) string {
+	if sessionID == "" && p.app != nil {
+		if sess := p.app.Session(); sess != nil {
+			sessionID = sess.ID
+		}
+	}
+	return sessionID
+}
+
+// Content can interleave between parallel forks even when they use the same agent.
+func (p *chatPage) trackContentSession(sessionID string) {
+	sessionID = p.contentSession(sessionID)
+	if sessionID != p.contentSessionID {
+		p.messages.BreakMessageGroup()
+		p.contentSessionID = sessionID
+	}
+}
+
+func (p *chatPage) handleAgentChoice(msg *runtime.AgentChoiceEvent) tea.Cmd {
+	if p.streamCancelled {
+		return nil
+	}
+	p.trackContentSession(msg.SessionID)
+	identity := p.contentIdentity.Resolve(p.contentSession(msg.SessionID), msg.MessageID)
+	// Track that we've received assistant content
+	p.hasReceivedAssistantContent = true
+	// Clear pending response indicator - first chunk has arrived
+	p.setPendingResponse(false)
+	// Content is useful activity: acknowledge the sidebar's outbound transfer
+	// box when this agent is a delegation target.
+	activityCmd := p.sidebar.SetAgentActivity(msg.AgentName)
+	return tea.Batch(activityCmd, p.messages.AppendAssistantContent(identity.SessionID, identity.MessageID, msg.AgentName, msg.Content))
+}
+
+func (p *chatPage) handleAgentChoiceReasoning(msg *runtime.AgentChoiceReasoningEvent) tea.Cmd {
+	if p.streamCancelled {
+		return nil
+	}
+	p.trackContentSession(msg.SessionID)
+	identity := p.contentIdentity.Resolve(p.contentSession(msg.SessionID), msg.MessageID)
+	p.setPendingResponse(false)
+	activityCmd := p.sidebar.SetAgentActivity(msg.AgentName)
+	return tea.Batch(activityCmd, p.messages.AppendReasoningContent(identity.SessionID, identity.MessageID, msg.AgentName, msg.Content))
+}
+
+// handleAgentSwitching forwards transfer_task hop boundaries to the sidebar
+// and schedules the presentation timers it arms, routed back to this page so
+// they expire on their owner even after a tab switch. A stop the sidebar
+// accepted (it closed the exact inverse hop of a recorded start) additionally
+// adds the delegation-return transition to the chat ("child returned control
+// to parent"); a stale stop — no matching hop — stays silent everywhere, and
+// a start adds nothing to the chat: the transfer_task tool call already
+// narrates the outbound direction. Boundaries arriving after the user
+// cancelled the stream are dropped entirely: the delegation they belong to
+// was already torn down visually.
+func (p *chatPage) handleAgentSwitching(msg *runtime.AgentSwitchingEvent) tea.Cmd {
+	if p.streamCancelled {
+		return nil
+	}
+	res := p.sidebar.SetAgentSwitching(msg.Switching, msg.FromAgent, msg.ToAgent)
+	cmd := tea.Batch(res.Cmd, p.scheduleTransferTimers(res.Timers))
+	if msg.Switching || !res.Accepted {
+		return cmd
+	}
+	returnCmd := p.messages.AddAgentReturn(msg.FromAgent, msg.ToAgent)
+	return tea.Batch(cmd, returnCmd, p.messages.ScrollToBottom())
+}
+
+func (p *chatPage) handleStreamStopped(msg *runtime.StreamStoppedEvent) tea.Cmd {
+	slog.Debug("handleStreamStopped called",
+		"agent", msg.AgentName,
+		"session_id", msg.SessionID,
+		"reason", msg.Reason,
+		"should_exit", p.app != nil && p.app.ShouldExitAfterFirstResponse(),
+		"has_content", p.hasReceivedAssistantContent,
+		"stream_depth", p.streamDepth)
+
+	p.contentIdentity.Finish(p.contentSession(msg.SessionID))
+	if p.contentSessionID == p.contentSession(msg.SessionID) {
+		p.messages.BreakMessageGroup()
+	}
+	if p.streamDepth > 0 {
+		p.streamDepth--
+		// Keep agentStack in sync: only pop when there was a depth to decrement,
+		// so spurious/duplicate StreamStopped events at depth 0 cannot cause
+		// the two slices to diverge.
+		if n := len(p.agentStack); n > 0 {
+			p.agentStack = p.agentStack[:n-1]
+		}
+	}
+
+	sidebarCmd := p.forwardToSidebar(msg)
+
+	// Sub-agent stream stopped — the parent is still running, so only
+	// forward to the sidebar and keep the working/cancel state intact.
+	// Without this guard, pressing Esc after a sub-agent completes but
+	// while the parent continues would have no effect.
+	// Also clear the now-stale "parent → child" labeled spinner and
+	// replace it with a plain parent spinner so the UI reflects the
+	// updated delegation state.
+	if p.streamDepth > 0 {
+		p.setPendingResponse(false)
+		return tea.Batch(p.messages.ScrollToBottom(), sidebarCmd, p.setPendingResponse(true))
+	}
+
+	// Outermost stream stopped — fully clean up. This is the exact-content
+	// boundary for the active root response; nested stops leave the parent's
+	// deferred tail intact until the parent itself stops or the user re-enters it.
+	if p.onRunFinish != nil {
+		p.onRunFinish(msg.Reason)
+	}
+	finalizeCmd := p.messages.FinalizeStream()
+	// Only play the success sound when the stream completed normally.
+	// Errors already trigger a failure sound via ErrorEvent, and
+	// user-initiated cancels don't warrant a chime.
+	if userconfig.Get().GetSound() && isSuccessfulStop(msg.Reason) {
+		duration := time.Since(p.streamStartTime)
+		threshold := time.Duration(userconfig.Get().GetSoundThreshold()) * time.Second
+		if duration >= threshold {
+			sound.Play(p.ctx(), sound.Success)
+		}
+	}
+	p.msgCancel = nil
+	p.streamCancelled = false
+	spinnerCmd := p.setWorking(false)
+	p.setPendingResponse(false)
+	queueCmd := p.processNextQueuedMessage()
+
+	var exitCmd tea.Cmd
+	if p.app.ShouldExitAfterFirstResponse() && p.hasReceivedAssistantContent {
+		slog.Debug("Exit after first response triggered, scheduling delayed exit")
+		routingID, application := p.routingID, p.app
+		exitCmd = p.global(tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg {
+			if routingID == "" {
+				return msgtypes.ExitAfterFirstResponseMsg{}
+			}
+			return GlobalMsg{TabID: routingID, Origin: p, Application: application, Inner: msgtypes.ExitAfterFirstResponseMsg{}}
+		}))
+	}
+
+	return tea.Batch(finalizeCmd, p.messages.ScrollToBottom(), spinnerCmd, sidebarCmd, queueCmd, exitCmd)
+}
+
+// handlePartialToolCall processes partial tool call events by rendering each
+// tool call as it streams in. The tool call appears with its name and a static
+// "pending" indicator (not animated) to show it's receiving data.
+func (p *chatPage) handlePartialToolCall(msg *runtime.PartialToolCallEvent) tea.Cmd {
+	p.setPendingResponse(false)
+	var toolDef tools.Tool
+	if msg.ToolDefinition != nil {
+		toolDef = *msg.ToolDefinition
+	}
+	// A tool call is useful activity even without any streamed text:
+	// acknowledge the sidebar's outbound transfer box.
+	activityCmd := p.sidebar.SetAgentActivity(msg.AgentName)
+	toolCmd := p.messages.AddOrUpdateToolCall(msg.AgentName, msg.ToolCall, toolDef, types.ToolStatusPending)
+	return tea.Batch(activityCmd, toolCmd, p.messages.ScrollToBottom())
+}
+
+func (p *chatPage) handleToolCallConfirmation(msg *runtime.ToolCallConfirmationEvent) tea.Cmd {
+	spinnerCmd := p.setWorking(false)
+	toolCmd := p.messages.AddOrUpdateToolCall(msg.AgentName, msg.ToolCall, msg.ToolDefinition, types.ToolStatusConfirmation)
+	dialogCmd := p.attentionDialogCmd(msg)
+	return tea.Batch(toolCmd, p.messages.ScrollToBottom(), spinnerCmd, dialogCmd)
+}
+
+func (p *chatPage) handleToolCall(msg *runtime.ToolCallEvent) tea.Cmd {
+	p.setPendingResponse(false)
+	spinnerCmd := p.setWorking(true)
+	sidebarCmd := p.forwardToSidebar(msg)
+	toolCmd := p.messages.AddOrUpdateToolCall(msg.AgentName, msg.ToolCall, msg.ToolDefinition, types.ToolStatusRunning)
+	return tea.Batch(toolCmd, p.messages.ScrollToBottom(), spinnerCmd, sidebarCmd)
+}
+
+func (p *chatPage) handleToolCallOutput(msg *runtime.ToolCallOutputEvent) tea.Cmd {
+	return tea.Batch(p.messages.AppendToolOutput(msg), p.messages.ScrollToBottom())
+}
+
+func (p *chatPage) handleShellCommand(msg *runtime.ShellOutputEvent) tea.Cmd {
+	if msg.CommandID == "" {
+		return p.messages.AddShellOutputMessage(msg.Output)
+	}
+
+	toolDef := tools.Tool{Name: builtinshell.ToolNameShell}
+	if msg.Command != "" {
+		arguments, _ := json.Marshal(map[string]string{"cmd": msg.Command})
+		toolCall := tools.ToolCall{
+			ID: msg.CommandID,
+			Function: tools.FunctionCall{
+				Name:      builtinshell.ToolNameShell,
+				Arguments: string(arguments),
+			},
+		}
+		if !msg.Done {
+			return tea.Batch(
+				p.messages.AddOrUpdateToolCall("", toolCall, toolDef, types.ToolStatusRunning),
+				p.messages.ScrollToBottom(),
+			)
+		}
+	}
+
+	if !msg.Done {
+		return tea.Batch(
+			p.messages.AppendToolOutput(&runtime.ToolCallOutputEvent{ToolCallID: msg.CommandID, Output: msg.Output}),
+			p.messages.ScrollToBottom(),
+		)
+	}
+
+	response := msg.Output
+	if msg.Error != "" && response == "" {
+		response = "Error: " + msg.Error
+	}
+	status := types.ToolStatusCompleted
+	if msg.Error != "" {
+		status = types.ToolStatusError
+	}
+	return tea.Batch(
+		p.messages.AddToolResult(&runtime.ToolCallResponseEvent{
+			ToolCallID:     msg.CommandID,
+			Response:       response,
+			Result:         &tools.ToolCallResult{Output: response, IsError: msg.Error != ""},
+			ToolDefinition: toolDef,
+		}, status),
+		p.messages.ScrollToBottom(),
+	)
+}
+
+func (p *chatPage) handleToolCallResponse(msg *runtime.ToolCallResponseEvent) tea.Cmd {
+	spinnerCmd := p.setWorking(true)
+	sidebarCmd := p.forwardToSidebar(msg)
+
+	status := types.ToolStatusCompleted
+	if msg.Result.IsError {
+		status = types.ToolStatusError
+	}
+	toolCmd := p.messages.AddToolResult(msg, status)
+
+	// Update todo sidebar if this is a todo tool
+	if msg.ToolDefinition.Category == "todo" && !msg.Result.IsError {
+		_ = p.sidebar.SetTodos(msg.Result)
+	}
+
+	return tea.Batch(toolCmd, p.messages.ScrollToBottom(), spinnerCmd, sidebarCmd)
+}
+
+// handleBudgetExceeded reports a run stopped by its budget. It stops the
+// spinner and raises a warning naming the limit that tripped, alongside
+// the assistant stop message the runtime already appended.
+//
+// Deliberately not a dialog: unlike the iteration cap there is nothing to
+// ask. A budget is a ceiling the operator set on purpose, so raising it
+// means editing the config rather than answering a prompt.
+func (p *chatPage) handleBudgetExceeded(msg *runtime.BudgetExceededEvent) tea.Cmd {
+	spinnerCmd := p.setWorking(false)
+	warnCmd := notification.WarningCmd(fmt.Sprintf(
+		"Run stopped by %s — used %s of %s.", msg.ConfigPath, msg.Used, msg.Max,
+	))
+	return tea.Batch(spinnerCmd, warnCmd)
+}
+
+func (p *chatPage) handleMaxIterationsReached(msg *runtime.MaxIterationsReachedEvent) tea.Cmd {
+	return tea.Batch(p.setWorking(false), p.attentionDialogCmd(msg))
+}
+
+func (p *chatPage) handleElicitationRequest(msg *runtime.ElicitationRequestEvent) tea.Cmd {
+	return tea.Batch(p.setWorking(false), p.attentionDialogCmd(msg))
+}
+
+func (p *chatPage) attentionDialogCmd(event tea.Msg) tea.Cmd {
+	// Hosted pages leave attention delivery to the tab's FIFO in the root Update.
+	if p.routingID != "" {
+		return nil
+	}
+	return core.CmdHandler(dialog.OpenDialogMsg{
+		Model:            dialog.NewAttentionDialog(p.ctx(), p.ar, p.app, p.sessionState, event, p.toolRenderers),
+		OriginatingEvent: event,
+	})
+}
+
+// isSuccessfulStop returns true when the stream reason indicates a
+// normal completion that warrants the success sound. Empty reason
+// (e.g. cache hits, early exits before a turn runs) is treated as
+// success to preserve backward compatibility.
+func isSuccessfulStop(reason string) bool {
+	switch reason {
+	case "", "normal", "continue", "steered":
+		return true
+	default:
+		return false
+	}
+}
+
+// routeSummary is the one-line, task-free description of a routing transition.
+func routeSummary(e *runtime.AgentRouteEvent) string {
+	summary := fmt.Sprintf("Routing %s → %s", e.FromAgent, e.ToAgent)
+	if e.Selected != "" {
+		summary += " (" + e.Selected
+		if e.Probability != nil {
+			summary += fmt.Sprintf(" %.0f%%", *e.Probability*100)
+		}
+		summary += ")"
+	}
+	return summary
+}

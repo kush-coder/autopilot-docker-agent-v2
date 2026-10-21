@@ -1,0 +1,899 @@
+package leantui
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"strings"
+	"time"
+	"uuid"
+
+	"charm.land/lipgloss/v2"
+	"github.com/atotto/clipboard"
+
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/effort"
+	"github.com/docker/docker-agent/pkg/leantui/ui"
+	"github.com/docker/docker-agent/pkg/modelpicker"
+	"github.com/docker/docker-agent/pkg/programstatus"
+	"github.com/docker/docker-agent/pkg/runtime"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/tools"
+	builtinshell "github.com/docker/docker-agent/pkg/tools/builtin/shell"
+	"github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/service"
+	tuitypes "github.com/docker/docker-agent/pkg/tui/types"
+)
+
+func (m *model) handleKey(ctx context.Context, k ui.Key) {
+	if k.Typ == ui.KeyCtrlO && m.screen.Settings == nil {
+		m.screen.Transcript.SetFullFilePreview(!m.screen.Transcript.FullFilePreview())
+		return
+	}
+	if m.screen.Confirm != nil {
+		if k.Typ == ui.KeyEsc || k.Typ == ui.KeyCtrlC {
+			m.handleInterrupt()
+		} else {
+			m.handleConfirmKey(k)
+		}
+		return
+	}
+
+	if m.screen.Settings != nil {
+		m.handleSettingsKey(k)
+		return
+	}
+
+	switch k.Typ {
+	case ui.KeyCtrlC:
+		m.handleInterrupt()
+	case ui.KeyCtrlD:
+		if m.screen.Editor.IsEmpty() {
+			m.quit()
+		} else {
+			m.screen.Editor.DeleteForward()
+		}
+	case ui.KeyEnter:
+		m.handleEnter(ctx)
+	case ui.KeyShiftEnter:
+		m.screen.Editor.Insert([]rune{'\n'})
+	case ui.KeyAltEnter:
+		m.submitEditorMode(ctx, m.screen.Editor.Text(), busySubmitFollowUp)
+	case ui.KeyAltUp:
+		m.cancelPendingMessages(ctx)
+	case ui.KeyTab:
+		m.handleTab()
+	case ui.KeyShiftTab:
+		m.handleCycleThinkingLevel(ctx)
+	case ui.KeyUp:
+		if m.screen.Autocomplete.Active {
+			m.screen.Autocomplete.MoveUp()
+		} else if !m.screen.Editor.Up(m.width) {
+			m.screen.Editor.HistoryPrev()
+		}
+	case ui.KeyDown:
+		if m.screen.Autocomplete.Active {
+			m.screen.Autocomplete.MoveDown()
+		} else if !m.screen.Editor.Down(m.width) {
+			m.screen.Editor.HistoryNext()
+		}
+	case ui.KeyLeft:
+		m.screen.Editor.MoveLeft()
+	case ui.KeyRight:
+		m.screen.Editor.MoveRight()
+	case ui.KeyWordLeft:
+		m.screen.Editor.MoveWordLeft()
+	case ui.KeyWordRight:
+		m.screen.Editor.MoveWordRight()
+	case ui.KeyHome:
+		m.screen.Editor.MoveLineStart()
+	case ui.KeyEnd:
+		m.screen.Editor.MoveLineEnd()
+	case ui.KeyBackspace:
+		m.screen.Editor.Backspace()
+	case ui.KeyDelete:
+		m.screen.Editor.DeleteForward()
+	case ui.KeyCtrlU:
+		m.screen.Editor.DeleteToLineStart()
+	case ui.KeyCtrlK:
+		m.screen.Editor.DeleteToLineEnd()
+	case ui.KeyCtrlW:
+		m.screen.Editor.DeleteWordBack()
+	case ui.KeyEsc:
+		if m.busy || m.runCancel != nil {
+			m.handleInterrupt()
+		} else {
+			m.screen.Autocomplete.Dismiss()
+		}
+	case ui.KeyCtrlL:
+		m.clearScreen()
+	case ui.KeyRune, ui.KeyPaste:
+		m.screen.Editor.Insert(k.Runes)
+	}
+
+	m.screen.Autocomplete.Sync(m.screen.Editor.Text())
+}
+
+func (m *model) cancelPendingMessages(ctx context.Context) bool {
+	if m.app == nil || len(m.pendingUsers) == 0 {
+		return false
+	}
+
+	cancelled := make([]string, 0, len(m.pendingUsers))
+	remaining := make([]ui.PendingUserMessage, 0, len(m.pendingUsers))
+	for _, pending := range m.pendingUsers {
+		followUp := pending.Kind == ui.PendingUserFollowUp
+		if pending.ID == "" || !m.app.CancelPendingMessage(ctx, runtime.QueuedMessage{ID: pending.ID}, followUp) {
+			remaining = append(remaining, pending)
+			continue
+		}
+		cancelled = append(cancelled, pending.Display)
+	}
+	if len(cancelled) == 0 {
+		return false
+	}
+
+	m.pendingUsers = remaining
+	m.screen.Editor.SetText(strings.Join(cancelled, "\n"))
+	m.screen.Autocomplete.Sync(m.screen.Editor.Text())
+	return true
+}
+
+func (m *model) handleInterrupt() {
+	switch {
+	case m.busy:
+		if m.runCancel != nil {
+			m.runCancel()
+		}
+		m.queue = nil
+		m.pendingUsers = nil
+		m.ignoredUsers = nil
+		m.screen.Confirm = nil
+		m.cancelMarkerPending = true
+		m.statusSession.Cancel(m.contentSession(""))
+	case !m.screen.Editor.IsEmpty():
+		m.screen.Editor.Reset()
+		m.screen.Autocomplete.Dismiss()
+	default:
+		m.quit()
+	}
+}
+
+func (m *model) handleEnter(ctx context.Context) {
+	if m.screen.Autocomplete.Active {
+		if cmd, ok := m.screen.Autocomplete.Current(); ok {
+			if m.screen.Autocomplete.IsFileCompletion() {
+				m.completeFile(cmd)
+				return
+			}
+			completion := m.screen.Autocomplete.Completion(cmd)
+			m.screen.Autocomplete.Dismiss()
+			m.submitEditor(ctx, completion)
+			return
+		}
+	}
+	m.submitEditor(ctx, m.screen.Editor.Text())
+}
+
+func (m *model) handleTab() {
+	if !m.screen.Autocomplete.Active {
+		return
+	}
+	if cmd, ok := m.screen.Autocomplete.Current(); ok {
+		if m.screen.Autocomplete.IsFileCompletion() {
+			m.completeFile(cmd)
+			return
+		}
+		m.screen.Editor.SetText(m.screen.Autocomplete.Completion(cmd) + " ")
+		m.screen.Autocomplete.Sync(m.screen.Editor.Text())
+	}
+}
+
+func (m *model) completeFile(cmd ui.Command) {
+	value := cmd.Value
+	if value == "" {
+		value = "@" + cmd.Name
+	}
+	m.screen.Editor.ReplaceCurrentWord(value + " ")
+	m.screen.Autocomplete.Dismiss()
+}
+
+func (m *model) handleCycleThinkingLevel(ctx context.Context) {
+	if !m.thinkingLevelChangeable() {
+		return
+	}
+	level, err := m.app.CycleAgentThinkingLevel(ctx)
+	if err != nil {
+		m.reportThinkingLevelError("change", err)
+		return
+	}
+	m.status.Thinking = level.String()
+}
+
+// handleSetThinkingLevel applies the /effort command: it sets the current
+// model's reasoning-effort level to the requested value.
+func (m *model) handleSetThinkingLevel(ctx context.Context, level string) {
+	if !m.thinkingLevelChangeable() {
+		return
+	}
+	if level == "" {
+		m.addNotice("", "Usage: /effort <none|minimal|low|medium|high|xhigh|max>", ui.StMuted())
+		return
+	}
+	parsed, ok := effort.Parse(level)
+	if !ok {
+		m.addNotice("✗ ", fmt.Sprintf("Unknown effort level %q (valid: none, minimal, low, medium, high, xhigh, max)", level), ui.StError())
+		return
+	}
+	applied, err := m.app.SetAgentThinkingLevel(ctx, parsed)
+	if err != nil {
+		m.reportThinkingLevelError("set", err)
+		return
+	}
+	m.status.Thinking = applied.String()
+	m.addNotice("", "Reasoning effort set to "+applied.String(), ui.StMuted())
+}
+
+// thinkingLevelChangeable reports whether the reasoning-effort level can be
+// changed, emitting an explanatory notice when it cannot.
+func (m *model) thinkingLevelChangeable() bool {
+	if m.app == nil {
+		return false
+	}
+	if !m.app.SupportsModelSwitching() {
+		m.addNotice("", "Thinking levels can't be changed with remote runtimes", ui.StMuted())
+		return false
+	}
+	return true
+}
+
+// reportThinkingLevelError emits a notice for a failed thinking-level change,
+// distinguishing the unsupported-model case from other failures.
+func (m *model) reportThinkingLevelError(action string, err error) {
+	if errors.Is(err, runtime.ErrUnsupported) {
+		m.addNotice("", "Current model does not support thinking levels", ui.StMuted())
+		return
+	}
+	m.addNotice("✗ ", fmt.Sprintf("Failed to %s thinking level: %v", action, err), ui.StError())
+}
+
+type busySubmitMode int
+
+const (
+	busySubmitSteer busySubmitMode = iota
+	busySubmitQueue
+	busySubmitFollowUp
+)
+
+type submitOptions struct {
+	fromEditor bool
+	busyMode   busySubmitMode
+}
+
+func (m *model) submitEditor(ctx context.Context, text string) {
+	mode := busySubmitSteer
+	if m.sendMode == messages.SendModeQueue {
+		mode = busySubmitQueue
+	}
+	m.submitEditorMode(ctx, text, mode)
+}
+
+func (m *model) submitEditorMode(ctx context.Context, text string, mode busySubmitMode) {
+	m.submit(ctx, text, submitOptions{fromEditor: true, busyMode: mode})
+}
+
+func (m *model) submitFollowUp(ctx context.Context, text string) {
+	m.submit(ctx, text, submitOptions{busyMode: busySubmitQueue})
+}
+
+func (m *model) submit(ctx context.Context, text string, opts submitOptions) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return
+	}
+	if opts.fromEditor {
+		if err := m.screen.Editor.RememberHistory(trimmed); err != nil {
+			slog.WarnContext(ctx, "Failed to save command history", "error", err)
+		}
+		m.screen.Editor.Reset()
+		m.screen.Autocomplete.Dismiss()
+	}
+
+	if command, ok := strings.CutPrefix(trimmed, "!"); ok {
+		m.runBangCommand(ctx, command)
+		return
+	}
+
+	if strings.HasPrefix(trimmed, "/") && m.handleSlash(ctx, trimmed, opts.busyMode) {
+		return
+	}
+
+	m.dispatchUserMessage(ctx, trimmed, trimmed, opts.busyMode)
+}
+
+func (m *model) runBangCommand(ctx context.Context, command string) {
+	if m.app.IsReadOnly() {
+		m.addNotice("⚠ ", "This session is read-only.", ui.StWarning())
+		return
+	}
+	m.app.RunBangCommand(ctx, command)
+}
+
+func shellCommandCall(id, command string) tools.ToolCall {
+	arguments, _ := json.Marshal(map[string]string{"cmd": command})
+	return tools.ToolCall{
+		ID: id,
+		Function: tools.FunctionCall{
+			Name:      builtinshell.ToolNameShell,
+			Arguments: string(arguments),
+		},
+	}
+}
+
+// handleSlash dispatches a slash command. It returns true when the command was
+// fully handled (built-in, skill, or agent command) and false when the input
+// should be treated as a normal message.
+func (m *model) handleSlash(ctx context.Context, text string, mode busySubmitMode) bool {
+	name, rest := splitCommand(text)
+	switch name {
+	case "exit", "quit":
+		m.quit()
+		return true
+	case "new":
+		m.eventGeneration.Add(1)
+		m.app.NewSession()
+		m.resetConversation()
+		m.addNotice("", "Started a new session.", ui.StMuted())
+		m.refreshCommands(ctx)
+		return true
+	case "clear":
+		m.clearScreen()
+		return true
+	case "copy":
+		m.copyLastResponse()
+		return true
+	case "settings":
+		m.openSettings()
+		return true
+	case "help":
+		m.commitHelp()
+		return true
+	case "sessions":
+		m.handleSessionsCommand(ctx, rest)
+		return true
+	case "compact":
+		m.addUserEcho(text)
+		m.startCompact(ctx, rest)
+		return true
+	case "model":
+		m.handleModelCommand(ctx, rest)
+		return true
+	case "effort":
+		m.handleSetThinkingLevel(ctx, rest)
+		return true
+	}
+
+	if skillName, task, ok := m.app.SkillCommandFork(ctx, text); ok {
+		m.addUserEcho(text)
+		m.startSkillFork(ctx, skillName, task)
+		return true
+	}
+
+	if _, _, ok := m.app.LookupCommand(ctx, text); ok {
+		m.dispatchUserMessage(ctx, text, m.app.ResolveInput(ctx, text), mode)
+		return true
+	}
+
+	if resolved, err := m.app.ResolveSkillCommand(ctx, text); err != nil {
+		m.addNotice("", err.Error(), ui.StMuted())
+		return true
+	} else if resolved != "" {
+		m.dispatchUserMessage(ctx, text, resolved, mode)
+		return true
+	}
+
+	return false
+}
+
+func (m *model) copyLastResponse() {
+	if m.app == nil || m.app.Session() == nil {
+		m.addNotice("", "No active session.", ui.StMuted())
+		return
+	}
+	lastResponse := m.app.Session().GetLastAssistantMessageContent()
+	if lastResponse == "" {
+		m.addNotice("", "No assistant response to copy.", ui.StMuted())
+		return
+	}
+	if m.term != nil {
+		m.term.SetClipboard(lastResponse)
+	}
+	_ = writeClipboard(lastResponse)
+	m.addNotice("", "Last response copied to clipboard.", ui.StMuted())
+}
+
+var writeClipboard = clipboard.WriteAll
+
+func (m *model) handleSessionsCommand(ctx context.Context, sessionID string) {
+	if m.busy {
+		m.addNotice("", "Wait for the current response to finish before switching sessions", ui.StMuted())
+		return
+	}
+	if m.app == nil || m.app.SessionStore() == nil {
+		m.addNotice("", "No session store configured", ui.StMuted())
+		return
+	}
+
+	if sessionID != "" {
+		m.resumeSession(ctx, sessionID)
+		return
+	}
+
+	summaries, err := m.app.SessionStore().GetSessionSummaries(ctx)
+	if err != nil {
+		m.addNotice("✗ ", "Failed to load sessions: "+err.Error(), ui.StError())
+		return
+	}
+
+	currentDir := cleanDirectory(m.app.Session().WorkingDir)
+	currentID := m.app.Session().ID
+	cmds := make([]ui.Command, 0, len(summaries))
+	for _, summary := range summaries {
+		if summary.ID == currentID || cleanDirectory(summary.WorkingDir) != currentDir {
+			continue
+		}
+		title := strings.TrimSpace(summary.Title)
+		if title == "" {
+			title = "Untitled"
+		}
+		s := summary
+		cmds = append(cmds, ui.Command{
+			Name:  title,
+			Desc:  fmt.Sprintf("%s · %d messages", s.CreatedAt.Local().Format("Jan 2 15:04"), s.NumMessages),
+			Value: s.ID,
+			MatchScore: func(query string) (int, bool) {
+				query = strings.ToLower(strings.TrimSpace(query))
+				if query == "" {
+					return 0, true
+				}
+				if strings.Contains(strings.ToLower(title), query) || strings.Contains(strings.ReplaceAll(strings.ToLower(s.ID), "-", ""), strings.ReplaceAll(query, "-", "")) {
+					return 1, true
+				}
+				return 0, false
+			},
+			Kind: ui.CmdBuiltin,
+		})
+	}
+	if len(cmds) == 0 {
+		m.addNotice("", "No previous sessions found in this directory", ui.StMuted())
+		return
+	}
+
+	m.screen.Autocomplete.SetScopedCommands("sessions ", cmds)
+	m.screen.Editor.SetText("/sessions ")
+	m.screen.Autocomplete.Sync(m.screen.Editor.Text())
+}
+
+func cleanDirectory(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return filepath.Clean(dir)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	return filepath.Clean(abs)
+}
+
+func (m *model) resumeSession(ctx context.Context, sessionID string) {
+	sess, err := m.app.SessionStore().GetSession(ctx, sessionID)
+	if err != nil {
+		m.addNotice("✗ ", "Failed to load session: "+err.Error(), ui.StError())
+		return
+	}
+	if cleanDirectory(sess.WorkingDir) != cleanDirectory(m.app.Session().WorkingDir) {
+		m.addNotice("✗ ", "Session is not from the current directory", ui.StError())
+		return
+	}
+
+	m.eventGeneration.Add(1)
+	m.app.ReplaceSession(ctx, sess)
+	m.resetConversation()
+	m.screen.Transcript = ui.NewTranscript()
+	m.sessionState = service.NewSessionState(sess)
+	m.loadSessionTranscript(sess)
+	m.refreshCommands(ctx)
+	title := strings.TrimSpace(sess.Title)
+	if title == "" {
+		title = sess.ID
+	}
+	m.addNotice("", "Resumed session: "+title, ui.StMuted())
+}
+
+func (m *model) loadInitialSessionTranscript() {
+	if m.app == nil || m.app.Session() == nil || len(m.app.Session().OwnMessages()) == 0 {
+		return
+	}
+	m.loadSessionTranscript(m.app.Session())
+}
+
+func (m *model) loadSessionTranscript(sess *session.Session) {
+	storedMessages := sess.OwnMessages()
+	toolResults := make(map[string]chat.Message)
+	for _, msg := range storedMessages {
+		if msg.Message.Role == chat.MessageRoleTool && msg.Message.ToolCallID != "" {
+			toolResults[msg.Message.ToolCallID] = msg.Message
+		}
+	}
+
+	for _, msg := range storedMessages {
+		if msg.Implicit {
+			continue
+		}
+		content := msg.Message.Content
+		switch msg.Message.Role {
+		case chat.MessageRoleUser:
+			m.addUserEcho(content)
+		case chat.MessageRoleAssistant:
+			content = chat.VisibleAssistantContent(content)
+			if msg.Message.ReasoningContent != "" {
+				reasoning := msg.Message.ReasoningContent
+				m.screen.Transcript.AddBlock(func(w int) []string { return ui.RenderReasoningLines(reasoning, w) })
+			}
+			if content != "" {
+				identity := m.contentIdentity.Resolve(sess.ID, msg.Message.MessageID)
+				m.screen.Transcript.AppendAssistantContent(identity, content)
+				m.screen.Transcript.FlushPending()
+				m.contentIdentity.Finish(sess.ID)
+			}
+			for i, toolCall := range msg.Message.ToolCalls {
+				toolDef := tools.Tool{}
+				if i < len(msg.Message.ToolDefinitions) {
+					toolDef = msg.Message.ToolDefinitions[i]
+				}
+				m.screen.Transcript.UpsertTool(msg.AgentName, toolCall, toolDef, tuitypes.ToolStatusCompleted)
+
+				result := toolResults[toolCall.ID]
+				toolResult := &tools.ToolCallResult{Output: result.Content, IsError: result.IsError}
+				m.screen.Transcript.FinishTool(toolCall.ID, ui.ToolResult{
+					Response:       result.Content,
+					Result:         toolResult,
+					AgentName:      msg.AgentName,
+					ToolDefinition: toolDef,
+				}, m.sessionState)
+			}
+		}
+	}
+}
+
+func modelCommands(models []runtime.ModelChoice) []ui.Command {
+	cmds := make([]ui.Command, 0, len(models))
+	for _, choice := range models {
+		desc := choice.Name
+		if choice.IsCurrent {
+			desc = strings.TrimSpace(desc + " (current)")
+		} else if choice.IsDefault {
+			desc = strings.TrimSpace(desc + " (default)")
+		}
+		value := choice.Ref
+		if choice.IsDefault {
+			value = "default"
+		}
+		cmds = append(cmds, ui.Command{
+			Name:  choice.Ref,
+			Desc:  desc,
+			Value: value,
+			MatchScore: func(query string) (int, bool) {
+				return modelpicker.Score(choice, query)
+			},
+			Kind: ui.CmdBuiltin,
+		})
+	}
+	return cmds
+}
+
+func (m *model) handleModelCommand(ctx context.Context, modelRef string) {
+	if m.app == nil || !m.app.SupportsModelSwitching() {
+		m.addNotice("", "Model switching is not supported with this runtime", ui.StMuted())
+		return
+	}
+
+	if modelRef == "" {
+		models := m.app.AvailableModels(ctx)
+		if len(models) == 0 {
+			m.addNotice("", "No models available for selection", ui.StMuted())
+			return
+		}
+		cmds := modelCommands(models)
+		m.screen.Autocomplete.SetScopedCommands("model ", cmds)
+		m.screen.Editor.SetText("/model ")
+		m.screen.Autocomplete.Sync(m.screen.Editor.Text())
+		return
+	}
+
+	if modelRef == "default" {
+		modelRef = ""
+	}
+	if err := m.app.SetCurrentAgentModel(ctx, modelRef); err != nil {
+		m.addNotice("✗ ", "Failed to change model: "+err.Error(), ui.StError())
+		return
+	}
+	m.refreshCommands(ctx)
+	if modelRef == "" {
+		m.addNotice("", "Model reset to default", ui.StMuted())
+		return
+	}
+	m.addNotice("", "Model changed to "+modelRef, ui.StMuted())
+}
+
+func (m *model) dispatchUserMessage(ctx context.Context, display, content string, mode busySubmitMode) {
+	if m.app.IsReadOnly() {
+		m.addUserEcho(display)
+		m.addNotice("⚠ ", "This session is read-only.", ui.StWarning())
+		return
+	}
+	if m.busy {
+		switch mode {
+		case busySubmitSteer:
+			msg := runtime.QueuedMessage{ID: uuid.NewV4().String(), Content: content}
+			if err := m.app.Steer(ctx, msg); err != nil {
+				m.addNotice("⚠ ", "Could not steer current response: "+err.Error(), ui.StWarning())
+				return
+			}
+			m.addPendingUser(msg.ID, display, content, ui.PendingUserSteer)
+			return
+		case busySubmitFollowUp:
+			msg := runtime.QueuedMessage{ID: uuid.NewV4().String(), Content: content}
+			if err := m.app.FollowUp(ctx, msg); err != nil {
+				m.addNotice("⚠ ", "Could not enqueue follow-up: "+err.Error(), ui.StWarning())
+				return
+			}
+			m.addPendingUser(msg.ID, display, content, ui.PendingUserFollowUp)
+			return
+		default:
+			m.enqueueFollowUp(display, content)
+			return
+		}
+	}
+	m.addUserEcho(display)
+	m.ignoreUserEcho(content)
+	m.startRun(ctx, content, nil)
+}
+
+func (m *model) enqueueFollowUp(display, content string) {
+	msg := ui.PendingUserMessage{Display: display, Content: content, Kind: ui.PendingUserFollowUp}
+	m.queue = append(m.queue, msg)
+	m.pendingUsers = append(m.pendingUsers, msg)
+}
+
+func (m *model) sendFirstMessage(ctx context.Context, msg, attachPath string) {
+	var atts []messages.Attachment
+	if attachPath != "" {
+		if abs, err := filepath.Abs(attachPath); err == nil {
+			atts = append(atts, messages.Attachment{Name: filepath.Base(abs), FilePath: abs})
+		}
+	}
+
+	trimmed := strings.TrimSpace(msg)
+	if command, ok := strings.CutPrefix(trimmed, "!"); ok {
+		m.runBangCommand(ctx, command)
+		return
+	}
+
+	content := msg
+	if strings.HasPrefix(trimmed, "/") {
+		if resolved := m.app.ResolveInput(ctx, trimmed); resolved != "" {
+			content = resolved
+		}
+	}
+
+	switch {
+	case trimmed != "":
+		m.addUserEcho(trimmed)
+		m.ignoreUserEcho(content)
+	case len(atts) > 0:
+		m.addNotice("", "(attached "+atts[0].Name+")", ui.StMuted())
+		m.ignoreUserEcho(content)
+	default:
+		return
+	}
+	m.startRun(ctx, content, atts)
+}
+
+// beginRun marks the model busy and returns a cancelable context for a new
+// run, storing its cancel func so it can be interrupted.
+func (m *model) beginRun(ctx context.Context) (context.Context, context.CancelFunc) {
+	runCtx, cancel := context.WithCancel(ctx)
+	runCtx = m.app.BeginOperation(runCtx)
+	m.runCancel = cancel
+	m.busy = true
+	m.cancelMarkerPending = false
+	m.statusSession.Start(m.contentSession(""))
+	return runCtx, cancel
+}
+
+func (m *model) startRun(ctx context.Context, message string, attachments []messages.Attachment) {
+	runCtx, cancel := m.beginRun(ctx)
+	m.app.Run(runCtx, cancel, message, attachments)
+}
+
+func (m *model) startCompact(ctx context.Context, prompt string) {
+	runCtx, cancel := m.beginRun(ctx)
+	m.app.CompactSession(runCtx, cancel, prompt)
+}
+
+func (m *model) startSkillFork(ctx context.Context, name, task string) {
+	runCtx, cancel := m.beginRun(ctx)
+	m.app.RunSkillFork(runCtx, cancel, name, task, nil)
+}
+
+func (m *model) refreshCommands(ctx context.Context) {
+	cmds := make([]ui.Command, 0)
+	for _, cmd := range builtinCommands() {
+		if !m.disabledCommands[cmd.Name] {
+			cmds = append(cmds, cmd)
+		}
+	}
+	for name, c := range m.app.CurrentAgentCommands(ctx) {
+		if m.disabledCommands[name] {
+			continue
+		}
+		cmds = append(cmds, ui.Command{Name: name, Desc: c.DisplayText(), Kind: ui.CmdAgent})
+	}
+	for _, sk := range m.app.CurrentAgentSkills() {
+		cmds = append(cmds, ui.Command{Name: sk.Name, Desc: sk.Description, Kind: ui.CmdAgent})
+	}
+	m.screen.Autocomplete.SetCommands(cmds)
+	var models []ui.Command
+	if !m.disabledCommands["model"] && m.app.SupportsModelSwitching() {
+		models = modelCommands(m.app.AvailableModels(ctx))
+	}
+	m.screen.Autocomplete.SetModels(models)
+}
+
+func (m *model) handleConfirmKey(k ui.Key) {
+	if k.Typ == ui.KeyEsc {
+		m.resolveConfirm(runtime.ResumeReject("rejected by user"))
+		return
+	}
+	if k.Typ != ui.KeyRune || len(k.Runes) == 0 {
+		return
+	}
+	switch k.Runes[0] {
+	case 'y', 'Y':
+		m.resolveConfirm(runtime.ResumeApprove())
+	case 'a', 'A':
+		m.resolveConfirm(runtime.ResumeApproveTool(m.screen.Confirm.Tool))
+	case 'b', 'B':
+		m.resolveConfirm(runtime.ResumeApproveBalanced())
+	case 's', 'S':
+		m.resolveConfirm(runtime.ResumeApproveAutonomous())
+	case 'n', 'N':
+		m.resolveConfirm(runtime.ResumeReject("rejected by user"))
+	}
+}
+
+func (m *model) resolveConfirm(req runtime.ResumeRequest) {
+	m.app.Resume(req)
+	m.screen.Confirm = nil
+	m.statusSession.Resolve(m.confirmationEvent)
+	m.confirmationEvent = nil
+}
+
+func (m *model) resetConversation() {
+	m.statusSession = programstatus.Session{}
+	m.confirmationEvent = nil
+	if m.runCancel != nil {
+		m.runCancel()
+		m.runCancel = nil
+	}
+	m.screen.Transcript.ClearActive()
+	m.queue = nil
+	m.pendingUsers = nil
+	m.ignoredUsers = nil
+	m.busy = false
+	m.streamDepth = 0
+	m.streamStartTime = time.Time{}
+	m.cancelMarkerPending = false
+	m.screen.Confirm = nil
+	m.usage.Reset()
+	m.status.ContextLength = 0
+	m.status.ContextLimit = 0
+	m.status.CompactionThreshold = 0
+	m.status.Compacting = false
+	m.status.Tokens = 0
+	m.status.Cost = 0
+	m.status.CostKnown = false
+}
+
+func (m *model) clearScreen() {
+	m.r.Repaint()
+}
+
+func (m *model) quit() {
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+	m.quitting = true
+}
+
+func (m *model) addUserEcho(text string) {
+	m.screen.Transcript.AddBlock(func(w int) []string { return ui.RenderUserLines(text, w) })
+}
+
+func (m *model) addPendingUser(id, display, content string, kind ui.PendingUserKind) {
+	m.pendingUsers = append(m.pendingUsers, ui.PendingUserMessage{ID: id, Display: display, Content: content, Kind: kind})
+}
+
+func (m *model) consumePendingUser(kind ui.PendingUserKind, content string) (ui.PendingUserMessage, bool) {
+	for i, msg := range m.pendingUsers {
+		if msg.Kind != kind || !samePendingUserContent(msg.Content, content) {
+			continue
+		}
+		m.pendingUsers = append(m.pendingUsers[:i], m.pendingUsers[i+1:]...)
+		return msg, true
+	}
+	return ui.PendingUserMessage{}, false
+}
+
+func samePendingUserContent(pending, emitted string) bool {
+	return pending == emitted || pending == strings.TrimSuffix(emitted, "\n")
+}
+
+func (m *model) ignoreUserEcho(content string) {
+	m.ignoredUsers = append(m.ignoredUsers, content)
+}
+
+func (m *model) consumeIgnoredUserEcho(content string) bool {
+	for i, msg := range m.ignoredUsers {
+		if msg != content {
+			continue
+		}
+		m.ignoredUsers = append(m.ignoredUsers[:i], m.ignoredUsers[i+1:]...)
+		return true
+	}
+	return false
+}
+
+func (m *model) addNotice(prefix, text string, style lipgloss.Style) {
+	m.screen.Transcript.AddBlock(func(w int) []string { return ui.RenderNoticeLines(prefix, text, w, style) })
+}
+
+func (m *model) commitHelp() {
+	m.screen.Transcript.AddBlock(func(int) []string {
+		return []string{
+			ui.StBold().Render("Commands"),
+			ui.StMuted().Render("  /new       start a new session"),
+			ui.StMuted().Render("  /sessions  resume a session from this directory"),
+			ui.StMuted().Render("  /compact   summarize and compact the conversation"),
+			ui.StMuted().Render("  /model     change the model for the current agent"),
+			ui.StMuted().Render("  /effort    set the model's reasoning effort (e.g. /effort high)"),
+			ui.StMuted().Render("  /copy      copy the last assistant response"),
+			ui.StMuted().Render("  /clear     clear the screen"),
+			ui.StMuted().Render("  /settings  change lean TUI settings"),
+			ui.StMuted().Render("  /help      show this help"),
+			ui.StMuted().Render("  /exit      quit"),
+			"",
+			ui.StBold().Render("Shortcuts"),
+			ui.StMuted().Render("  Enter      send             Shift+Enter insert newline"),
+			ui.StMuted().Render("  Alt+Enter  follow up        Up/Down     history"),
+			ui.StMuted().Render("  Tab        complete command Shift+Tab   cycle thinking"),
+			ui.StMuted().Render("  Option+Up  edit all pending messages"),
+			ui.StMuted().Render("  Esc        interrupt         Ctrl+C     cancel / quit"),
+			ui.StMuted().Render("  Ctrl+W     delete previous word"),
+			ui.StMuted().Render("  Ctrl+O     toggle compact / complete file previews"),
+		}
+	})
+}
+
+func splitCommand(text string) (name, rest string) {
+	text = strings.TrimPrefix(strings.TrimSpace(text), "/")
+	name, rest, _ = strings.Cut(text, " ")
+	return name, strings.TrimSpace(rest)
+}

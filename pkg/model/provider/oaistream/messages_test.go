@@ -1,0 +1,388 @@
+package oaistream
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/openai/openai-go/v3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/modelinfo"
+	"github.com/docker/docker-agent/pkg/modelsdev"
+	"github.com/docker/docker-agent/pkg/tools"
+)
+
+func TestConvertMultiContent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		multiContent []chat.MessagePart
+		wantCount    int
+	}{
+		{
+			name:         "empty",
+			multiContent: []chat.MessagePart{},
+			wantCount:    0,
+		},
+		{
+			name: "text only",
+			multiContent: []chat.MessagePart{
+				{Type: chat.MessagePartTypeText, Text: "Hello"},
+				{Type: chat.MessagePartTypeText, Text: "World"},
+			},
+			wantCount: 2,
+		},
+		{
+			name: "with image",
+			multiContent: []chat.MessagePart{
+				{Type: chat.MessagePartTypeText, Text: "Check this out"},
+				{Type: chat.MessagePartTypeImageURL, ImageURL: &chat.MessageImageURL{URL: "http://example.com/img.png"}},
+			},
+			wantCount: 2,
+		},
+		{
+			name: "image with nil URL produces no part",
+			multiContent: []chat.MessagePart{
+				{Type: chat.MessagePartTypeImageURL, ImageURL: nil},
+			},
+			wantCount: 0,
+		},
+		{
+			// The converter forwards all parts as-is; normalizeMessageContent in the
+			// session layer strips whitespace-only text parts before real usage.
+			name: "whitespace-only text part forwarded as-is",
+			multiContent: []chat.MessagePart{
+				{Type: chat.MessagePartTypeText, Text: "   "},
+				{Type: chat.MessagePartTypeText, Text: "hello"},
+			},
+			wantCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := ConvertMultiContent(t.Context(), tt.multiContent, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), nil)
+			assert.Len(t, result, tt.wantCount)
+		})
+	}
+}
+
+func TestConvertMessages(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		messages []chat.Message
+		want     int // expected number of converted messages
+	}{
+		{
+			name:     "empty",
+			messages: []chat.Message{},
+			want:     0,
+		},
+		{
+			name: "system message",
+			messages: []chat.Message{
+				{Role: chat.MessageRoleSystem, Content: "You are helpful"},
+			},
+			want: 1,
+		},
+		{
+			name: "user message",
+			messages: []chat.Message{
+				{Role: chat.MessageRoleUser, Content: "Hello"},
+			},
+			want: 1,
+		},
+		{
+			name: "assistant message",
+			messages: []chat.Message{
+				{Role: chat.MessageRoleAssistant, Content: "Hi there!"},
+			},
+			want: 1,
+		},
+		{
+			name: "skip empty assistant message",
+			messages: []chat.Message{
+				{Role: chat.MessageRoleAssistant, Content: "   "},
+			},
+			want: 0,
+		},
+		{
+			name: "assistant with tool calls not skipped",
+			messages: []chat.Message{
+				{Role: chat.MessageRoleAssistant, Content: "", ToolCalls: []tools.ToolCall{{ID: "1"}}},
+			},
+			want: 1,
+		},
+		{
+			name: "tool message",
+			messages: []chat.Message{
+				{Role: chat.MessageRoleTool, Content: "Result", ToolCallID: "call_123"},
+			},
+			want: 1,
+		},
+		{
+			name: "full conversation",
+			messages: []chat.Message{
+				{Role: chat.MessageRoleSystem, Content: "You are helpful"},
+				{Role: chat.MessageRoleUser, Content: "Hello"},
+				{Role: chat.MessageRoleAssistant, Content: "Hi!"},
+			},
+			want: 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := ConvertMessages(t.Context(), tt.messages, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), nil)
+			assert.Len(t, result, tt.want)
+		})
+	}
+}
+
+func TestMergeConsecutiveMessages(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		messages []openai.ChatCompletionMessageParamUnion
+		want     int
+	}{
+		{
+			name:     "empty",
+			messages: []openai.ChatCompletionMessageParamUnion{},
+			want:     0,
+		},
+		{
+			name: "single message",
+			messages: []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage("Hello"),
+			},
+			want: 1,
+		},
+		{
+			name: "two consecutive system messages",
+			messages: []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage("You are helpful"),
+				openai.SystemMessage("Be concise"),
+			},
+			want: 1,
+		},
+		{
+			name: "two consecutive user messages",
+			messages: []openai.ChatCompletionMessageParamUnion{
+				openai.UserMessage("Hello"),
+				openai.UserMessage("World"),
+			},
+			want: 1,
+		},
+		{
+			name: "alternating roles",
+			messages: []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage("System"),
+				openai.UserMessage("User"),
+				openai.UserMessage("User2"),
+			},
+			want: 2, // System merged alone, two users merged
+		},
+		{
+			name: "no merging needed",
+			messages: []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage("System"),
+				openai.UserMessage("User"),
+			},
+			want: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := MergeConsecutiveMessages(tt.messages)
+			assert.Len(t, result, tt.want)
+		})
+	}
+}
+
+func TestMergeMixedContentPreservesOrder(t *testing.T) {
+	t.Parallel()
+	for _, role := range []string{"user", "system"} {
+		t.Run(role, func(t *testing.T) {
+			t.Parallel()
+			var messages []openai.ChatCompletionMessageParamUnion
+			if role == "user" {
+				messages = []openai.ChatCompletionMessageParamUnion{
+					openai.UserMessage("before"),
+					openai.UserMessage([]openai.ChatCompletionContentPartUnionParam{openai.TextContentPart("part one")}),
+					openai.UserMessage("between"),
+					openai.UserMessage([]openai.ChatCompletionContentPartUnionParam{openai.TextContentPart("part two")}),
+					openai.UserMessage("after"),
+				}
+			} else {
+				messages = []openai.ChatCompletionMessageParamUnion{
+					openai.SystemMessage("before"),
+					openai.SystemMessage([]openai.ChatCompletionContentPartTextParam{{Text: "part one"}}),
+					openai.SystemMessage("between"),
+					openai.SystemMessage([]openai.ChatCompletionContentPartTextParam{{Text: "part two"}}),
+					openai.SystemMessage("after"),
+				}
+			}
+			merged := MergeConsecutiveMessages(messages)
+			require.Len(t, merged, 1)
+			var texts []string
+			for _, part := range getMultiContent(merged[0]) {
+				texts = append(texts, part.OfText.Text)
+			}
+			for _, part := range getSystemTextParts(merged[0]) {
+				texts = append(texts, part.Text)
+			}
+			assert.Equal(t, []string{"before", "part one", "between", "part two", "after"}, texts)
+		})
+	}
+}
+
+func TestJSONSchema_MarshalJSON(t *testing.T) {
+	t.Parallel()
+
+	schema := JSONSchema{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{
+				"type": "string",
+			},
+		},
+	}
+
+	data, err := schema.MarshalJSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"type":"object"`)
+	assert.Contains(t, string(data), `"properties"`)
+}
+
+func TestConvertToolImagesAsAttachments(t *testing.T) {
+	t.Parallel()
+	const imageURL = "data:image/png;base64,AQID"
+	tests := []struct {
+		name string
+		part chat.MessagePart
+		want string
+	}{
+		{name: "image URL", part: chat.MessagePart{Type: chat.MessagePartTypeImageURL, ImageURL: &chat.MessageImageURL{URL: imageURL}}, want: imageURL},
+		{name: "image document", part: chat.MessagePart{Type: chat.MessagePartTypeDocument, Document: &chat.Document{Name: "image.png", MimeType: "image/png", Source: chat.DocumentSource{InlineData: []byte{1, 2, 3}}}}, want: imageURL},
+		{name: "nil image URL", part: chat.MessagePart{Type: chat.MessagePartTypeImageURL}},
+		{name: "nil document", part: chat.MessagePart{Type: chat.MessagePartTypeDocument}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			messages := []chat.Message{
+				{Role: chat.MessageRoleAssistant, ToolCalls: []tools.ToolCall{{ID: "A"}, {ID: "B"}}},
+				{Role: chat.MessageRoleTool, ToolCallID: "A", MultiContent: []chat.MessagePart{{Type: chat.MessagePartTypeText, Text: "Read image file"}, tt.part}},
+				{Role: chat.MessageRoleTool, ToolCallID: "B", Content: "Done"},
+			}
+			result := ConvertMessagesWithCaps(t.Context(), messages, modelinfo.CapsWith(true, true, false, false))
+			if tt.want == "" {
+				require.Len(t, result, 3)
+			} else {
+				require.Len(t, result, 4)
+				parts := result[3].OfUser.Content.OfArrayOfContentParts
+				require.Len(t, parts, 2)
+				assert.Contains(t, parts[0].OfText.Text, "tool_call_id=A")
+				require.NotNil(t, parts[1].OfImageURL)
+				assert.Equal(t, tt.want, parts[1].OfImageURL.ImageURL.URL)
+			}
+			require.NotNil(t, result[1].OfTool)
+			assert.Equal(t, "A", result[1].OfTool.ToolCallID)
+			parts := result[1].OfTool.Content.OfArrayOfContentParts
+			require.Len(t, parts, 1)
+			assert.Equal(t, "Read image file", parts[0].Text)
+			require.NotNil(t, result[2].OfTool)
+			assert.Equal(t, "B", result[2].OfTool.ToolCallID)
+		})
+	}
+}
+
+func TestToolAttachmentsFollowCompleteResults(t *testing.T) {
+	t.Parallel()
+	const imageURL = "data:image/png;base64,AQID"
+	assistant := chat.Message{Role: chat.MessageRoleAssistant, ToolCalls: []tools.ToolCall{{ID: "A"}, {ID: "B"}}}
+	image := func(id string) chat.Message {
+		return chat.Message{Role: chat.MessageRoleTool, ToolCallID: id, MultiContent: []chat.MessagePart{
+			{Type: chat.MessagePartTypeText, Text: "read " + id},
+			{Type: chat.MessagePartTypeImageURL, ImageURL: &chat.MessageImageURL{URL: imageURL, Detail: chat.ImageURLDetailHigh}},
+		}}
+	}
+	failure := chat.Message{Role: chat.MessageRoleTool, ToolCallID: "A", Content: "read failed", IsError: true}
+	user := chat.Message{Role: chat.MessageRoleUser, Content: "continue"}
+	document := func(mime string, data []byte, text string) chat.Message {
+		return chat.Message{Role: chat.MessageRoleTool, ToolCallID: "B", MultiContent: []chat.MessagePart{
+			{Type: chat.MessagePartTypeText, Text: "document"},
+			{Type: chat.MessagePartTypeDocument, Document: &chat.Document{
+				Name: "attachment", MimeType: mime, Source: chat.DocumentSource{InlineData: data, InlineText: text},
+			}},
+		}}
+	}
+	for _, tc := range []struct {
+		name     string
+		messages []chat.Message
+		roles    []string
+		origins  []string
+	}{
+		{"reverse completion", []chat.Message{assistant, image("B"), image("A")}, []string{"assistant", "tool", "tool", "user", "user"}, []string{"B", "A"}},
+		{"tool error", []chat.Message{assistant, image("B"), failure}, []string{"assistant", "tool", "tool", "user"}, []string{"B"}},
+		{"empty assistant", []chat.Message{assistant, image("B"), {Role: chat.MessageRoleAssistant, Content: " \n"}, image("A")}, []string{"assistant", "tool", "tool", "user", "user"}, []string{"B", "A"}},
+		{"following user", []chat.Message{assistant, image("B"), failure, user}, []string{"assistant", "tool", "tool", "user", "user"}, []string{"B"}},
+		{"consecutive batches", []chat.Message{assistant, failure, image("B"), assistant, image("A"), image("B")}, []string{"assistant", "tool", "tool", "user", "assistant", "tool", "tool", "user", "user"}, []string{"B", "A", "B"}},
+		{"missing result is not invented", []chat.Message{assistant, image("A")}, []string{"assistant", "tool", "user"}, []string{"A"}},
+		{"PDF", []chat.Message{assistant, document("application/pdf", []byte("%PDF"), ""), failure}, []string{"assistant", "tool", "tool", "user"}, []string{"B"}},
+		{"text document", []chat.Message{assistant, document("text/plain", nil, "report"), failure}, []string{"assistant", "tool", "tool", "user"}, []string{"B"}},
+		{"audio", []chat.Message{assistant, document("audio/wav", []byte{1, 2, 3}, ""), failure}, []string{"assistant", "tool", "tool", "user"}, []string{"B"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			before, err := json.Marshal(tc.messages)
+			require.NoError(t, err)
+			converted := ConvertMessagesWithCaps(t.Context(), tc.messages, modelinfo.CapsWith(true, true, true, false))
+			var roles, origins, calls []string
+			for _, msg := range converted {
+				roles = append(roles, getMessageRole(msg))
+				if msg.OfTool != nil {
+					calls = append(calls, msg.OfTool.ToolCallID)
+					for _, part := range msg.OfTool.Content.OfArrayOfContentParts {
+						assert.NotContains(t, part.Text, "data:")
+					}
+				}
+				if msg.OfUser != nil && len(msg.OfUser.Content.OfArrayOfContentParts) > 0 {
+					parts := msg.OfUser.Content.OfArrayOfContentParts
+					require.Len(t, parts, 2)
+					require.Less(t, len(origins), len(tc.origins))
+					id := tc.origins[len(origins)]
+					assert.Contains(t, parts[0].OfText.Text, "tool_call_id="+id)
+					origins = append(origins, id)
+					if parts[1].OfImageURL != nil {
+						assert.Equal(t, imageURL, parts[1].OfImageURL.ImageURL.URL)
+						assert.Equal(t, "high", parts[1].OfImageURL.ImageURL.Detail)
+					}
+				}
+			}
+			assert.Equal(t, tc.roles, roles)
+			assert.Equal(t, tc.origins, origins)
+			var expectedCalls []string
+			for _, msg := range tc.messages {
+				if msg.Role == chat.MessageRoleTool {
+					expectedCalls = append(expectedCalls, msg.ToolCallID)
+				}
+			}
+			assert.Equal(t, expectedCalls, calls)
+			after, err := json.Marshal(tc.messages)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after))
+		})
+	}
+}
